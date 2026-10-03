@@ -1,6 +1,6 @@
 # Isolated Proton worker
 
-The mpai proof-of-concept is user-scoped beneath
+The reference worker is user-scoped beneath
 `~/.local/share/vragecage-worker`. It deliberately does not add i386 packages to the host. Valve's
 32-bit SteamCMD bootstrap runs against a privately extracted Debian i386 glibc through a
 Bubblewrap mount namespace created by `steamcmd-user.sh`. The private loader is mounted at the
@@ -8,12 +8,12 @@ interpreter path expected by Valve's unmodified binary; the host filesystem rema
 SteamCMD's self-verification remains valid.
 
 UMU supplies the managed Proton build and Steam Linux Runtime. The Space Engineers prefix, server
-files, instance data, and logs remain separate. Never point an instance at Blake's desktop Space
+files, instance data, and logs remain separate. Never point an instance at the operator's desktop Space
 Engineers saves or mod directory.
 
 ## Proven runtime
 
-The mpai worker has completed a real-engine smoke on Space Engineers Dedicated Server
+The reference worker has completed a real-engine smoke on Space Engineers Dedicated Server
 `01_210_014`, UMU Launcher `1.4.4`, and `UMU-Proton-10.0-4`. The smoke loaded Keen's bundled Empty
 World, reached `Game ready...`, and shut down through `SIGINT` with a world save and clean Steam
 logout.
@@ -30,7 +30,7 @@ implementation. Run `./scripts/install-cli.sh` from the repository, then use `vr
 `smoke`, `prepare`, `run`, `wait`, `status`, `stop`, or `receipt` from any checkout.
 The full command contract and exit codes are documented in [`docs/cli.md`](../docs/cli.md).
 
-On mpai, with the user-scoped dependencies already provisioned:
+On a provisioned worker:
 
 ```bash
 export VRAGECAGE_WORKER_ROOT="$HOME/.local/share/vragecage-worker"
@@ -69,7 +69,7 @@ weaken the readiness receipt around it.
 ## Provisioning boundary
 
 These checked-in scripts document and operate the proven worker, but they are not yet a universal
-host installer. The current mpai provisioning is user-scoped and intentionally preserves the
+host installer. The reference provisioning is user-scoped and intentionally preserves the
 downloaded SteamCMD, UMU runtime, Proton prefix, dedicated-server files, and immutable test logs
 outside Git. `vragecage doctor` verifies that substrate before use. Reproducing it on another host
 should become a separate, checksum-pinned provisioning slice rather than being hidden inside

@@ -23,7 +23,7 @@ install only the bridge/test mod and the mod under test.
 
 Tier 2 answers: "Does it still work inside the real engine?"
 
-The official Dedicated Server targets Windows. The approved mpai feasibility slice now runs the
+The official Dedicated Server targets Windows. The approved Linux feasibility slice now runs the
 unmodified server through user-scoped UMU/Proton and runs the unmodified 32-bit SteamCMD in a
 private Bubblewrap mount namespace. It changes no system packages. A real smoke has loaded a world,
 reached `Game ready...`, and shut down with a clean save. This proves the worker substrate, not the
@@ -80,7 +80,7 @@ Automate correctness, authority, lifecycle, recovery, and reproducibility. Keep 
 1. Harden the micro-world contracts, add property/oracle testing, and adapt Voidwright's pure core.
 2. Define fixture and telemetry schemas plus a fake bridge for harness tests.
 3. Build the server-side bridge mod with no external transport; prove world-marker and authority gates.
-4. **Complete:** prove the isolated engine worker on mpai via user-scoped UMU/Proton; retain the
+4. **Complete:** prove the isolated Linux engine worker via user-scoped UMU/Proton; retain the
    receipt and lifecycle gates.
 5. Add one flat rover scenario end-to-end before terrain, air, hybrid, or combat cases.
 

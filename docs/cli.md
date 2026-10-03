@@ -6,9 +6,10 @@ own repository.
 
 ## Addressing the worker
 
-The default SSH target is the provisioned mpai host, `alu52@10.0.0.182`. Select a different target
-with `--host` or `VRAGECAGE_HOST`. Use `--local` only while operating directly on a provisioned
-worker.
+Select a provisioned SSH target with `--host` or `VRAGECAGE_HOST`. For a durable local default,
+create `~/.config/vragecage/config.json` containing `{"host":"user@worker-host"}`. Use `--local`
+only while operating directly on a provisioned worker. The repository intentionally contains no
+operator username, hostname, or network address.
 
 The client deliberately passes `-F /dev/null` to SSH. This avoids depending on workstation SSH
 configuration and keeps the worker address explicit.

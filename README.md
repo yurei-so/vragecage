@@ -39,8 +39,8 @@ Install the repository-independent command once:
 vragecage doctor
 ```
 
-The client defaults to the provisioned mpai worker. Override it with `--host`,
-`VRAGECAGE_HOST`, or use `--local` on the worker itself.
+Select a provisioned worker with `--host`, `VRAGECAGE_HOST`, or
+`~/.config/vragecage/config.json`. Use `--local` while operating on the worker itself.
 
 ```bash
 # Disposable full lifecycle, ending in a hashed JSON receipt.
@@ -59,6 +59,5 @@ Instance names are bounded and validated. Existing instances are not overlaid un
 `--reprepare` is explicit. Persistent starts use a per-instance user service; stops target the
 named instance and refuse ambiguous process matches.
 
-The command is reusable from any local repository, but the remote worker is currently provisioned
-specifically on mpai. Provisioning a second host remains an operator task; the CLI does not install
-SteamCMD, UMU/Proton, Space Engineers, or host packages.
+The command is reusable from any local repository, but worker provisioning remains an operator
+task. The CLI does not install SteamCMD, UMU/Proton, Space Engineers, or host packages.

@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 
-DEFAULT_HOST = "alu52@10.0.0.182"
 REMOTE_CLI = ".local/share/vragecage-worker/vragecage"
 INSTANCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -31,6 +30,19 @@ def validate_instance(value: str) -> str:
 
 def worker_root() -> Path:
     return Path(os.environ.get("VRAGECAGE_WORKER_ROOT", "~/.local/share/vragecage-worker")).expanduser()
+
+
+def configured_host() -> str | None:
+    if host := os.environ.get("VRAGECAGE_HOST"):
+        return host
+    config = Path.home() / ".config/vragecage/config.json"
+    if not config.is_file():
+        return None
+    try:
+        value = json.loads(config.read_text()).get("host")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def run_checked(argv: list[str], *, env: dict[str, str] | None = None) -> int:
@@ -229,7 +241,11 @@ def worker_main(args: argparse.Namespace) -> int:
 def client_main(args: argparse.Namespace) -> int:
     if args.local:
         return worker_main(args)
-    host = args.host or os.environ.get("VRAGECAGE_HOST", DEFAULT_HOST)
+    host = args.host or configured_host()
+    if host is None:
+        raise SystemExit(
+            "worker target required: pass --host, set VRAGECAGE_HOST, or configure ~/.config/vragecage/config.json"
+        )
     forwarded = ["_worker", args.command]
     if hasattr(args, "instance"):
         forwarded.append(args.instance)
@@ -245,7 +261,7 @@ def client_main(args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="vragecage", description="Deterministic and real-engine Space Engineers test runner")
-    result.add_argument("--host", help=f"worker SSH target (default: VRAGECAGE_HOST or {DEFAULT_HOST})")
+    result.add_argument("--host", help="worker SSH target (or use VRAGECAGE_HOST/config.json)")
     result.add_argument("--local", action="store_true", help="operate on the current host instead of SSH")
     subparsers = result.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="verify worker prerequisites")
