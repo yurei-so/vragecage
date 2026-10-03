@@ -23,4 +23,4 @@ jobs:
       - run: python3 -m py_compile bin/vragecage worker/server-receipt.py
       - run: bin/vragecage --help
       - run: VRAGECAGE_CLI_BIN="$RUNNER_TEMP/bin" scripts/install-cli.sh
-      - run: "$RUNNER_TEMP/bin/vragecage" --help
+      - run: '"$RUNNER_TEMP/bin/vragecage" --help'
