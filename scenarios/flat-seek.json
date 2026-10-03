@@ -1,0 +1,20 @@
+{
+  "schema": "vragecage.scenario/v1",
+  "id": "flat-seek",
+  "seed": 8826,
+  "tick_milliseconds": 100,
+  "maximum_ticks": 500,
+  "vehicle": {
+    "position": { "x": 0, "z": 0 },
+    "heading_radians": 0,
+    "radius": 0.5,
+    "maximum_speed": 5,
+    "acceleration": 3,
+    "turn_rate_radians_per_second": 1.5
+  },
+  "goal": {
+    "position": { "x": 10, "z": 0 },
+    "tolerance": 0.5
+  },
+  "obstacles": []
+}

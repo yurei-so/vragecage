@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+<MyConfigDedicated xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <SessionSettings>
+    <GameMode>Creative</GameMode>
+    <InventorySizeMultiplier>1</InventorySizeMultiplier>
+    <AssemblerSpeedMultiplier>1</AssemblerSpeedMultiplier>
+    <AssemblerEfficiencyMultiplier>1</AssemblerEfficiencyMultiplier>
+    <RefinerySpeedMultiplier>1</RefinerySpeedMultiplier>
+    <OnlineMode>PRIVATE</OnlineMode>
+    <MaxPlayers>1</MaxPlayers>
+    <MaxFloatingObjects>16</MaxFloatingObjects>
+    <MaxBackupSaves>1</MaxBackupSaves>
+    <MaxGridSize>0</MaxGridSize>
+    <MaxBlocksPerPlayer>0</MaxBlocksPerPlayer>
+    <TotalPCU>100000</TotalPCU>
+    <BlockLimitsEnabled>NONE</BlockLimitsEnabled>
+    <EnvironmentHostility>SAFE</EnvironmentHostility>
+    <AutoHealing>true</AutoHealing>
+    <EnableCopyPaste>true</EnableCopyPaste>
+    <WeaponsEnabled>false</WeaponsEnabled>
+    <ThrusterDamage>false</ThrusterDamage>
+    <EnableSpectator>true</EnableSpectator>
+    <WorldSizeKm>0</WorldSizeKm>
+    <RespawnShipDelete>false</RespawnShipDelete>
+    <ResetOwnership>false</ResetOwnership>
+    <WelderSpeedMultiplier>1</WelderSpeedMultiplier>
+    <GrinderSpeedMultiplier>1</GrinderSpeedMultiplier>
+    <RealisticSound>false</RealisticSound>
+    <HackSpeedMultiplier>1</HackSpeedMultiplier>
+    <PermanentDeath>false</PermanentDeath>
+    <AutoSaveInMinutes>0</AutoSaveInMinutes>
+    <SpawnShipTimeMultiplier>0</SpawnShipTimeMultiplier>
+    <ProceduralDensity>0</ProceduralDensity>
+    <ProceduralSeed>0</ProceduralSeed>
+    <DestructibleBlocks>true</DestructibleBlocks>
+    <EnableIngameScripts>true</EnableIngameScripts>
+    <ViewDistance>5000</ViewDistance>
+    <EnableOxygen>true</EnableOxygen>
+    <EnableOxygenPressurization>true</EnableOxygenPressurization>
+    <EnableResearch>false</EnableResearch>
+    <Enable3rdPersonView>true</Enable3rdPersonView>
+    <EnableFlora>false</EnableFlora>
+    <EnableConvertToStation>true</EnableConvertToStation>
+    <StationVoxelSupport>false</StationVoxelSupport>
+    <EnableSunRotation>false</EnableSunRotation>
+    <EnableRespawnShips>false</EnableRespawnShips>
+    <ScenarioEditMode>false</ScenarioEditMode>
+    <Scenario>false</Scenario>
+    <CanJoinRunning>false</CanJoinRunning>
+    <PhysicsIterations>8</PhysicsIterations>
+    <EnableJetpack>true</EnableJetpack>
+    <SpawnWithTools>true</SpawnWithTools>
+    <StartInRespawnScreen>false</StartInRespawnScreen>
+    <EnableVoxelDestruction>true</EnableVoxelDestruction>
+    <MaxDrones>0</MaxDrones>
+    <EnableWolfs>false</EnableWolfs>
+    <EnableSpiders>false</EnableSpiders>
+    <EnableStructuralSimulation>false</EnableStructuralSimulation>
+    <MaxActiveFracturePieces>0</MaxActiveFracturePieces>
+    <EnableScripterRole>false</EnableScripterRole>
+    <ExperimentalMode>true</ExperimentalMode>
+    <EnableVoxelHand>false</EnableVoxelHand>
+    <BlockTypeLimits><dictionary /></BlockTypeLimits>
+  </SessionSettings>
+  <Scenario>
+    <TypeId>MyObjectBuilder_ScenarioDefinition</TypeId>
+    <SubtypeId>EmptyWorld</SubtypeId>
+  </Scenario>
+  <LoadWorld>@LOAD_WORLD@</LoadWorld>
+  <IP>@BIND_IP@</IP>
+  <SteamPort>@STEAM_PORT@</SteamPort>
+  <ServerPort>@SERVER_PORT@</ServerPort>
+  <AsteroidAmount>0</AsteroidAmount>
+  <Administrators />
+  <Banned />
+  <Mods />
+  <GroupID>0</GroupID>
+  <ServerName>VRageCage Loopback</ServerName>
+  <WorldName>VRageCage Empty World</WorldName>
+  <PauseGameWhenEmpty>false</PauseGameWhenEmpty>
+  <IgnoreLastSession>true</IgnoreLastSession>
+  <RemoteApiEnabled>false</RemoteApiEnabled>
+</MyConfigDedicated>

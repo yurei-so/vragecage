@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yurei.so/vragecage/contracts/scenario.schema.json",
+  "title": "VRageCage micro-world scenario",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "seed", "tick_milliseconds", "maximum_ticks", "vehicle", "goal", "obstacles"],
+  "properties": {
+    "schema": { "const": "vragecage.scenario/v1" },
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "seed": { "type": "integer" },
+    "tick_milliseconds": { "type": "integer", "minimum": 1, "maximum": 1000 },
+    "maximum_ticks": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+    "vehicle": { "$ref": "#/$defs/vehicle" },
+    "goal": { "$ref": "#/$defs/goal" },
+    "obstacles": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/obstacle" } }
+  },
+  "$defs": {
+    "point": {
+      "type": "object", "additionalProperties": false, "required": ["x", "z"],
+      "properties": { "x": { "type": "number" }, "z": { "type": "number" } }
+    },
+    "vehicle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["position", "heading_radians", "radius", "maximum_speed", "acceleration", "turn_rate_radians_per_second"],
+      "properties": {
+        "position": { "$ref": "#/$defs/point" }, "heading_radians": { "type": "number" },
+        "radius": { "type": "number", "exclusiveMinimum": 0 },
+        "maximum_speed": { "type": "number", "exclusiveMinimum": 0 },
+        "acceleration": { "type": "number", "exclusiveMinimum": 0 },
+        "turn_rate_radians_per_second": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "goal": {
+      "type": "object", "additionalProperties": false, "required": ["position", "tolerance"],
+      "properties": { "position": { "$ref": "#/$defs/point" }, "tolerance": { "type": "number", "exclusiveMinimum": 0 } }
+    },
+    "obstacle": {
+      "type": "object", "additionalProperties": false, "required": ["id", "center", "radius"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "center": { "$ref": "#/$defs/point" }, "radius": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

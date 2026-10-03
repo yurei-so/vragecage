@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yurei.so/vragecage/contracts/bridge-command.schema.json",
+  "title": "VRageCage bridge command",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "operation_id", "scenario_id", "command"],
+  "properties": {
+    "schema": { "const": "vragecage.bridge-command/v1" },
+    "operation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "scenario_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "command": {
+      "enum": ["load_fixture", "reset", "set_destination", "start", "stop", "snapshot"]
+    },
+    "payload": { "type": "object", "maxProperties": 32 }
+  }
+}
