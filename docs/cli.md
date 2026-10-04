@@ -65,8 +65,11 @@ commands are never silently replayed by a later run.
 `fixture-inspect` exposes bounded structural metadata from the disposable copy without starting the
 engine. `fixture-opt-in` is the only offline sector mutation currently supported: while the service
 is stopped, it identifies exactly one Remote Control by positive entity ID and prefixes its copied
-name with `[Voidwright]`. The source save is untouched. The sector hashes before and after the edit,
-controller/grid IDs, names, operation ID, and timestamp are appended to a fixture-bound edit ledger.
+grid identity with `[Voidwright]`. The source save is untouched. If VRAGE left an `.sbsB5` binary
+sector cache beside the XML sector, the copy's cache is hash-receipted and moved into that edit's
+quarantine directory so the engine cannot silently load stale state over the audited XML. The sector
+hashes before and after the edit, controller/grid IDs, names, operation ID, cache receipt, and
+timestamp are appended to a fixture-bound edit ledger.
 
 `--engine` is selected at `prepare` time (`proton`, the default, or `magnetar`) and persisted in
 `.vragecage-engine`. Follow-up commands read that marker. Magnetar stages a name-derived synthetic
@@ -115,7 +118,7 @@ plugin evidence reaches the successful `complete` terminal state. Accepted, acqu
 events prove progress only; timeout, controller loss/unavailability, and unsupported-controller are
 terminal failures. Server readiness and operation completion are deliberately separate facts.
 If an offline fixture edit ledger exists, run activation verifies its identity, operation chain, and
-the edited controller names against the stopped-world sector, then snapshots both ledger and sector
+the edited grid/controller identity against the stopped-world sector, then snapshots both ledger and sector
 hashes. Receipts bind that activation snapshot and report the current post-run sector hash separately,
 because VRAGE legitimately rewrites its own world files while saving.
 

@@ -90,6 +90,7 @@ def grids(tree: ET.ElementTree) -> list[dict[str, object]]:
             if controller_id and controller_id.isdigit():
                 controllers.append({
                     "entity_id": int(controller_id),
+                    "entity_name": block.findtext("Name"),
                     "custom_name": block.findtext("CustomName"),
                     "subtype": block.findtext("SubtypeName"),
                 })
@@ -168,11 +169,15 @@ def opt_in(path: Path, controller_id: int, label: str | None) -> dict[str, objec
         raise SystemExit(f"expected exactly one Remote Control with entity ID {controller_id}; found {len(matches)}")
     grid, block = matches[0]
     old_name = block.findtext("CustomName") or ""
+    old_entity_name = block.findtext("Name") or ""
+    old_grid_name = grid.findtext("DisplayName") or grid.findtext("Name") or ""
     base_name = label or old_name or grid.findtext("DisplayName") or "Remote Control"
     if len(base_name) > 80 or "\n" in base_name or "\r" in base_name:
         raise SystemExit("fixture controller label must be at most 80 characters on one line")
     new_name = base_name if base_name.startswith("[Voidwright]") else f"[Voidwright] {base_name}"
-    if old_name == new_name:
+    new_entity_name = f"[Voidwright]:{controller_id}"
+    new_grid_name = old_grid_name if old_grid_name.startswith("[Voidwright]") else f"[Voidwright] {old_grid_name}"
+    if old_grid_name == new_grid_name:
         return {**inspection(instance, lab, imported), "status": "already_opted_in", "controller_id": controller_id}
     ledger_path = instance / LEDGER_FILE
     if ledger_path.is_symlink():
@@ -195,33 +200,77 @@ def opt_in(path: Path, controller_id: int, label: str | None) -> dict[str, objec
         raise SystemExit("fixture edit ledger does not match this fixture")
     sector_raw = sector.read_bytes()
     before = sha256(sector)
+    operation_id = secrets.token_hex(16)
+    binary_cache = sector.with_name(sector.name + "B5")
+    if binary_cache.is_symlink():
+        raise SystemExit("fixture binary sector cache must not be a symbolic link")
+    binary_cache_sha256 = sha256(binary_cache) if binary_cache.is_file() else None
     custom_name = block.find("CustomName")
     if custom_name is None:
         custom_name = ET.Element("CustomName")
         children = list(block)
-        insert_at = next(
-            (index for index, child in enumerate(children)
-             if child.tag in {"ComponentContainer", "ShowOnHUD", "ShowInTerminal", "Enabled"}),
-            len(children),
+        # RemoteControl's object-builder schema places ComponentContainer before
+        # terminal metadata. ElementTree accepts arbitrary order, but VRage's
+        # serializer silently ignores CustomName when it precedes the component
+        # container and then drops it on the next save.
+        component_at = next(
+            (index for index, child in enumerate(children) if child.tag == "ComponentContainer"),
+            None,
         )
+        if component_at is not None:
+            insert_at = component_at + 1
+        else:
+            insert_at = next(
+                (index for index, child in enumerate(children)
+                 if child.tag in {"ShowOnHUD", "ShowInTerminal", "Enabled"}),
+                len(children),
+            )
         block.insert(insert_at, custom_name)
     custom_name.text = new_name
+    entity_name = block.find("Name")
+    if entity_name is None:
+        entity_name = ET.Element("Name")
+        entity_id_at = next(
+            (index for index, child in enumerate(list(block)) if child.tag == "EntityId"),
+            -1,
+        )
+        block.insert(entity_id_at + 1, entity_name)
+    entity_name.text = new_entity_name
+    grid_name = grid.find("DisplayName")
+    if grid_name is None:
+        grid_name = ET.Element("DisplayName")
+        grid.insert(0, grid_name)
+    grid_name.text = new_grid_name
     temporary = sector.with_name(sector.name + ".tmp")
     tree.write(temporary, encoding="utf-8", xml_declaration=True)
     os.chmod(temporary, sector.stat().st_mode & 0o777)
     ET.parse(temporary)
     os.replace(temporary, sector)
     after = sha256(sector)
+    cache_quarantine = None
+    if binary_cache.is_file():
+        quarantine_dir = instance / "Quarantine" / "fixture-edits" / operation_id
+        quarantine_dir.mkdir(parents=True, exist_ok=False)
+        cache_quarantine = quarantine_dir / binary_cache.name
+        os.replace(binary_cache, cache_quarantine)
     edit = {
-        "operation_id": secrets.token_hex(16),
+        "operation_id": operation_id,
         "action": "voidwright-opt-in",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "controller_id": controller_id,
         "grid_id": int(grid.findtext("EntityId") or 0),
         "old_name": old_name,
         "new_name": new_name,
+        "old_entity_name": old_entity_name,
+        "new_entity_name": new_entity_name,
+        "old_grid_name": old_grid_name,
+        "new_grid_name": new_grid_name,
         "sector_sha256_before": before,
         "sector_sha256_after": after,
+        "binary_cache_sha256": binary_cache_sha256,
+        "binary_cache_quarantine": (
+            str(cache_quarantine.relative_to(instance)) if cache_quarantine is not None else None
+        ),
         "previous_operation_id": ledger["edits"][-1].get("operation_id") if ledger["edits"] else None,
     }
     ledger["edits"].append(edit)
@@ -232,6 +281,8 @@ def opt_in(path: Path, controller_id: int, label: str | None) -> dict[str, objec
         rollback.write_bytes(sector_raw)
         os.chmod(rollback, sector.stat().st_mode & 0o777)
         os.replace(rollback, sector)
+        if cache_quarantine is not None and cache_quarantine.is_file():
+            os.replace(cache_quarantine, binary_cache)
         raise
     return {**inspection(instance, lab, imported), "status": "opted_in", "edit": edit}
 

@@ -107,7 +107,7 @@ def fixture_snapshot(instance: Path, contract: dict[str, object]) -> dict[str, o
             or not isinstance(edits, list) or not edits):
         raise SystemExit("fixture edit ledger does not match the active lab contract")
     previous = None
-    expected_names: dict[int, str] = {}
+    expected_names: dict[int, tuple[str, str]] = {}
     operation_ids: set[str] = set()
     for edit in edits:
         if (not isinstance(edit, dict) or edit.get("action") != "voidwright-opt-in"
@@ -121,7 +121,14 @@ def fixture_snapshot(instance: Path, contract: dict[str, object]) -> dict[str, o
             raise SystemExit("fixture edit ledger contains an invalid edit chain")
         previous = edit["operation_id"]
         operation_ids.add(previous)
-        expected_names[edit["controller_id"]] = edit["new_name"]
+        grid_carrier = edit.get("new_grid_name")
+        entity_carrier = edit.get("new_entity_name")
+        expected_names[edit["controller_id"]] = (
+            "grid" if isinstance(grid_carrier, str) else
+            "entity" if isinstance(entity_carrier, str) else "custom",
+            grid_carrier if isinstance(grid_carrier, str) else
+            entity_carrier if isinstance(entity_carrier, str) else edit["new_name"],
+        )
     sector = instance / "World/SANDBOX_0_0_0_.sbs"
     if sector.is_symlink() or not sector.is_file():
         raise SystemExit("fixture sector must be a regular non-symlink file")
@@ -129,15 +136,26 @@ def fixture_snapshot(instance: Path, contract: dict[str, object]) -> dict[str, o
         tree = ET.parse(sector)
     except ET.ParseError as error:
         raise SystemExit(f"invalid fixture sector XML: {error}")
-    actual_names: dict[int, str] = {}
-    for block in tree.getroot().iter("MyObjectBuilder_CubeBlock"):
-        if block.get(XSI_TYPE) != "MyObjectBuilder_RemoteControl":
+    actual_names: dict[int, tuple[str, str, str]] = {}
+    for entity in tree.getroot().iter("MyObjectBuilder_EntityBase"):
+        if entity.get(XSI_TYPE) != "MyObjectBuilder_CubeGrid":
             continue
-        entity_id = block.findtext("EntityId")
-        if entity_id and entity_id.isdigit():
-            actual_names[int(entity_id)] = block.findtext("CustomName") or ""
+        grid_name = entity.findtext("DisplayName") or ""
+        blocks = entity.find("CubeBlocks")
+        for block in list(blocks) if blocks is not None else []:
+            if block.get(XSI_TYPE) != "MyObjectBuilder_RemoteControl":
+                continue
+            entity_id = block.findtext("EntityId")
+            if entity_id and entity_id.isdigit():
+                actual_names[int(entity_id)] = (
+                    grid_name,
+                    block.findtext("Name") or "",
+                    block.findtext("CustomName") or "",
+                )
     for controller_id, expected in expected_names.items():
-        if actual_names.get(controller_id) != expected:
+        actual = actual_names.get(controller_id, ("", "", ""))
+        actual_value = actual[0] if expected[0] == "grid" else actual[1] if expected[0] == "entity" else actual[2]
+        if actual_value != expected[1]:
             raise SystemExit(
                 f"fixture edit outcome is not present for controller {controller_id}"
             )

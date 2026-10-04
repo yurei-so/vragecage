@@ -124,7 +124,8 @@ PY
 mkdir -p "$worker_root/incoming/imported-world"
 printf '<Checkpoint><Mods><ModItem><Name>TestMod</Name></ModItem><ModItem><Name>Published</Name><PublishedFileId>123</PublishedFileId></ModItem></Mods><Gps><dictionary><item><Key>42</Key><Value><Entries><Entry><name>Red Zone</name><description>test target</description><coords><X>1</X><Y>2</Y><Z>3</Z></coords></Entry></Entries></Value></item></dictionary></Gps></Checkpoint>\n' > "$worker_root/incoming/imported-world/Sandbox.sbc"
 printf '<WorldConfiguration><Mods><ModItem><Name>TestMod</Name><PublishedFileId>0</PublishedFileId></ModItem><ModItem><Name>Published</Name><PublishedFileId>123</PublishedFileId></ModItem></Mods></WorldConfiguration>\n' > "$worker_root/incoming/imported-world/Sandbox_config.sbc"
-printf '<Sector xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><SectorObjects><MyObjectBuilder_EntityBase xsi:type="MyObjectBuilder_CubeGrid"><EntityId>9001</EntityId><DisplayName>Camera Drone</DisplayName><GridSizeEnum>Small</GridSizeEnum><CubeBlocks><MyObjectBuilder_CubeBlock xsi:type="MyObjectBuilder_RemoteControl"><EntityId>12345</EntityId><SubtypeName>SmallBlockRemoteControl</SubtypeName></MyObjectBuilder_CubeBlock></CubeBlocks></MyObjectBuilder_EntityBase></SectorObjects></Sector>\n' > "$worker_root/incoming/imported-world/SANDBOX_0_0_0_.sbs"
+printf '<Sector xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><SectorObjects><MyObjectBuilder_EntityBase xsi:type="MyObjectBuilder_CubeGrid"><EntityId>9001</EntityId><DisplayName>Camera Drone</DisplayName><GridSizeEnum>Small</GridSizeEnum><CubeBlocks><MyObjectBuilder_CubeBlock xsi:type="MyObjectBuilder_RemoteControl"><SubtypeName>SmallBlockRemoteControl</SubtypeName><EntityId>12345</EntityId><ComponentContainer><Components /></ComponentContainer><ShowOnHUD>false</ShowOnHUD></MyObjectBuilder_CubeBlock></CubeBlocks></MyObjectBuilder_EntityBase></SectorObjects></Sector>\n' > "$worker_root/incoming/imported-world/SANDBOX_0_0_0_.sbs"
+printf 'stale binary cache\n' > "$worker_root/incoming/imported-world/SANDBOX_0_0_0_.sbsB5"
 VRAGECAGE_WORKER_ROOT="$worker_root" VRAGECAGE_BIND_IP=0.0.0.0 \
 VRAGECAGE_ALLOW_NON_LOOPBACK=1 \
   "$repo_root/worker/import-world.py" imported "$worker_root/incoming/imported-world" \
@@ -139,7 +140,7 @@ import sys
 receipt = json.load(open(sys.argv[1], encoding="utf-8"))
 assert receipt["schema"] == "vragecage.world-import.v1"
 assert receipt["engine"] == "magnetar"
-assert receipt["file_count"] == 3
+assert receipt["file_count"] == 4
 assert receipt["byte_count"] > 0
 assert len(receipt["tree_sha256"]) == 64
 PY
@@ -231,12 +232,20 @@ result = json.loads(sys.argv[1])
 instance = Path(sys.argv[2])
 assert result["status"] == "opted_in"
 assert result["edit"]["new_name"] == "[Voidwright] Camera Drone"
+assert result["edit"]["new_grid_name"] == "[Voidwright] Camera Drone"
 assert len(result["edit_ledger_sha256"]) == 64
+assert len(result["edit"]["binary_cache_sha256"]) == 64
 tree = ET.parse(instance / "World/SANDBOX_0_0_0_.sbs")
 block = tree.getroot().find(".//MyObjectBuilder_CubeBlock")
 assert block.findtext("CustomName") == "[Voidwright] Camera Drone"
+assert tree.getroot().find(".//MyObjectBuilder_EntityBase/DisplayName").text == "[Voidwright] Camera Drone"
+children = [child.tag for child in block]
+assert children.index("ComponentContainer") < children.index("CustomName") < children.index("ShowOnHUD")
 ledger = json.loads((instance / ".vragecage-fixture-edits.json").read_text())
 assert len(ledger["edits"]) == 1
+cache_receipt = instance / ledger["edits"][0]["binary_cache_quarantine"]
+assert cache_receipt.read_text() == "stale binary cache\n"
+assert not (instance / "World/SANDBOX_0_0_0_.sbsB5").exists()
 PY
 already="$($repo_root/worker/fixture-contract.py opt-in-voidwright \
   "$worker_root/instances/imported" 12345 --label 'Camera Drone')"
