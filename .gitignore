@@ -18,3 +18,4 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+.dotnet-home/

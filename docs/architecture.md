@@ -17,32 +17,55 @@ Tier 1 answers: "Is our logic internally correct and reproducible?"
 ## Tier 2: disposable real-engine worker
 
 The worker launches Space Engineers Dedicated Server against a unique data directory and a
-disposable world snapshot. The implemented lifecycle owns preparation, startup, readiness,
-timeout, graceful shutdown, log capture, and hashed receipts. Once the bridge exists, each run will
-install only the bridge/test mod and the mod under test.
+disposable world snapshot. The implemented lifecycle owns preparation, safe world import, startup,
+readiness, bounded observation gates, timeout, graceful shutdown, log capture, and hashed receipts.
+Imported saves are copied and hash-receipted; the operator's original is never run in place.
 
 Tier 2 answers: "Does it still work inside the real engine?"
 
-The official Dedicated Server targets Windows. The approved Linux feasibility slice now runs the
-unmodified server through user-scoped UMU/Proton and runs the unmodified 32-bit SteamCMD in a
-private Bubblewrap mount namespace. It changes no system packages. A real smoke has loaded a world,
-reached `Game ready...`, and shut down with a clean save. This proves the worker substrate, not the
-bridge or a Voidwright scenario.
+### Destructive lab authority
+
+`stage-world --destructive-lab` grants one imported Magnetar fixture universal harness authority.
+This is intentionally a world-level boundary rather than a grid ownership model: every grid inside
+the copied world is an unsupported development target, while the source save remains untouched.
+The authority is valid only when the instance contract, source import receipt, configured world
+path, fresh launch run ID, and quarantine directory all agree. The engine owns and may rewrite the
+contents of `World`, so authority metadata deliberately remains outside that mutable directory.
+
+Each launch creates `Quarantine/<run-id>/` and passes that run identity to the engine. Generated
+worlds, blueprints, screenshots, traces, and other exports are untrusted until a future explicit
+release workflow promotes an individual artifact. A destructive-lab instance must never overwrite
+its source save or silently publish Workshop content.
+
+Commands are one-shot. Activation consumes a pending bounded command into the new run directory;
+the command's operation ID, run ID, evidence, logs, package hashes, and terminal receipt remain
+correlated even if compilation or startup fails before actuation.
+
+The official Dedicated Server targets Windows. The Proton backend runs that unmodified server
+through user-scoped UMU and runs the unmodified 32-bit SteamCMD in a private Bubblewrap mount
+namespace. The optional Magnetar backend is a separate native-Linux route for unpublished local-mod
+integration; it preserves a private Steam-shaped install/cache topology and loads only explicitly
+staged packages. Neither changes system packages. Real smokes have loaded worlds, reached
+`Game ready...`, and shut down with clean saves. A copied rover world has also loaded Voidwright
+headlessly and produced contract-bound Land and Hybrid vehicle observations. This proves real
+vehicle discovery, not actuator control or route completion.
 
 ## Narrow bridge
 
 The bridge is test instrumentation, not a production remote-control service.
 
-- Server-authoritative session component; fail closed when not dedicated or not in an explicitly
-  marked VRageCage world.
-- Fixed allowlist of versioned commands. No arbitrary scripts, terminal actions, paths, or entity IDs.
-- Local transport only. Prefer an append-only inbox/outbox beneath the worker's unique data path;
-  use mod messages only for an attached test observer.
+- Server-authoritative Magnetar plugin; fail closed outside a validated destructive-lab run.
+- Fixed allowlist of versioned commands. No arbitrary scripts, terminal actions, paths, or target
+  types; a bounded drive command names one positive controller entity ID inside the disposable fixture.
+- The engine may directly control fixture grids under the universal harness principal. This is not
+  a player, faction, or reusable production authorization identity.
+- Local transport only. Artifacts remain beneath the active run's quarantine directory.
 - Commands carry operation and scenario IDs. Duplicate operation IDs replay the original receipt.
 - Monotonic event sequence numbers expose accepted, running, and terminal checkpoints honestly.
 - Payloads are bounded. Large traces are written as artifacts and referenced by hash/path.
 
-Initial command set: load fixture, reset, set destination, start, stop, and snapshot.
+Current command set: one bounded drive-distance operation against an existing controller in the
+copied fixture. Fixture lifecycle remains a worker concern rather than a general in-engine command.
 
 ## Evidence model
 
@@ -80,9 +103,12 @@ Automate correctness, authority, lifecycle, recovery, and reproducibility. Keep 
 1. Harden the micro-world contracts, add property/oracle testing, and adapt Voidwright's pure core.
 2. Define fixture and telemetry schemas plus a fake bridge for harness tests.
 3. Build the server-side bridge mod with no external transport; prove world-marker and authority gates.
-4. **Complete:** prove the isolated Linux engine worker via user-scoped UMU/Proton; retain the
-   receipt and lifecycle gates.
-5. Add one flat rover scenario end-to-end before terrain, air, hybrid, or combat cases.
+4. **Complete:** prove isolated Linux workers through both UMU/Proton and native Magnetar; retain
+   backend-specific receipt, package-integrity, and lifecycle gates.
+5. **Complete:** copied-world Land and Hybrid discovery runs end-to-end with semantic receipt
+   gates. A one-shot destructive-lab command moved a copied rover a bounded distance through the
+   Magnetar server plugin, stopped it, and produced correlated operation/run/log/package receipts.
+   Terrain-aware steering, Hybrid/AIR actuation, and combat remain later slices.
 
 ## Primary references
 

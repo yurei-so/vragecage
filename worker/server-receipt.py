@@ -27,10 +27,17 @@ def main() -> int:
     log = latest_log(instance)
     raw = log.read_bytes()
     text = raw.decode("utf-8", errors="replace")
+    fatal_patterns = (
+        r"Exception while loading world",
+        r"Fatal error",
+        r"MOD_ERROR",
+        r"Local mods are not allowed in multiplayer\.",
+        r"Unable to download mods\.",
+    )
     fatal_markers = [
         line.strip()
         for line in text.splitlines()
-        if re.search(r"(?:Exception while loading world|Fatal error|MOD_ERROR)", line)
+        if any(re.search(pattern, line) for pattern in fatal_patterns)
     ]
     receipt = {
         "schema": "vragecage.server-receipt.v1",

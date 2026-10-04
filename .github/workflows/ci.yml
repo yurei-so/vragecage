@@ -20,7 +20,7 @@ jobs:
       - run: dotnet run --project src/VrageCage.Cli/VrageCage.Cli.csproj -- scenarios/flat-seek.json > /tmp/vragecage-trace.jsonl
       - run: worker/tests/test-scripts.sh
       - run: bash -n scripts/*.sh worker/*.sh worker/tests/*.sh
-      - run: python3 -m py_compile bin/vragecage worker/server-receipt.py
+      - run: python3 -m py_compile bin/vragecage worker/*.py
       - run: bin/vragecage --help
       - run: VRAGECAGE_CLI_BIN="$RUNNER_TEMP/bin" scripts/install-cli.sh
       - run: '"$RUNNER_TEMP/bin/vragecage" --help'

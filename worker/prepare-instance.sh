@@ -8,7 +8,7 @@ server_port="${VRAGECAGE_SERVER_PORT:-27017}"
 steam_port="${VRAGECAGE_STEAM_PORT:-8767}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 instance="$worker_root/instances/$instance_name"
-source_world="$worker_root/server/Content/CustomWorlds/Empty World"
+source_world="${VRAGECAGE_SOURCE_WORLD:-$worker_root/server/Content/CustomWorlds/Empty World}"
 template="$script_dir/fixtures/SpaceEngineers-Dedicated.cfg.in"
 
 case "$instance_name" in
@@ -37,4 +37,5 @@ sed \
   -e "s|@SERVER_PORT@|$server_port|g" \
   "$template" > "$instance/SpaceEngineers-Dedicated.cfg"
 
+printf 'proton\n' > "$instance/.vragecage-engine"
 printf 'prepared %s\n' "$instance"

@@ -1,4 +1,4 @@
-# Isolated Proton worker
+# Isolated real-engine worker
 
 The reference worker is user-scoped beneath
 `~/.local/share/vragecage-worker`. It deliberately does not add i386 packages to the host. Valve's
@@ -8,8 +8,14 @@ interpreter path expected by Valve's unmodified binary; the host filesystem rema
 SteamCMD's self-verification remains valid.
 
 UMU supplies the managed Proton build and Steam Linux Runtime. The Space Engineers prefix, server
-files, instance data, and logs remain separate. Never point an instance at the operator's desktop Space
-Engineers saves or mod directory.
+files, instance data, and logs remain separate. Never run an instance directly against the
+operator's desktop Space Engineers save or mod directory. `stage-world` and `stage-mod` read and
+copy those sources into isolated worker storage before execution.
+
+`stage-world --destructive-lab` is Magnetar-only and grants universal test-harness authority inside
+the copied world. The source remains read-only. Authority metadata lives at the instance root,
+outside the engine-owned `World` directory, while every launch receives a fresh run ID and private quarantine folder.
+Anything exported from that folder remains untrusted; no artifact-promotion command exists yet.
 
 ## Proven runtime
 
@@ -27,7 +33,8 @@ required for Steamworks server initialization; without them the process exits im
 
 The normal interface is the top-level `vragecage` CLI; these scripts remain the auditable worker
 implementation. Run `./scripts/install-cli.sh` from the repository, then use `vragecage doctor`,
-`smoke`, `prepare`, `run`, `wait`, `status`, `stop`, or `receipt` from any checkout.
+`smoke`, `prepare`, `stage-world`, `stage-mod`, `run`, `wait`, `status`, `stop`, or `receipt` from
+any checkout.
 The full command contract and exit codes are documented in [`docs/cli.md`](../docs/cli.md).
 
 On a provisioned worker:
@@ -74,3 +81,20 @@ downloaded SteamCMD, UMU runtime, Proton prefix, dedicated-server files, and imm
 outside Git. `vragecage doctor` verifies that substrate before use. Reproducing it on another host
 should become a separate, checksum-pinned provisioning slice rather than being hidden inside
 `prepare` or `run`.
+
+## Magnetar backend
+
+Magnetar is an explicit second backend for unpublished local-mod integration. Provision an
+operator-selected, tested build at `$VRAGECAGE_WORKER_ROOT/magnetar/current`, a private .NET runtime
+at `$VRAGECAGE_WORKER_ROOT/dotnet`, and a Steam-shaped server/cache tree rooted at
+`$VRAGECAGE_WORKER_ROOT/magnetar-steam`. The `current` path is an explicit operator boundary, not a
+repository-managed version pin. `vragecage doctor --engine magnetar` verifies the runtime, launcher,
+server, and managed/native Steam libraries before use.
+
+The backend trusts the configured MagnetarHub only for Magnetar's compatibility plugins. Local mod
+packages are copied into the private cache under a deterministic synthetic ID; they are never
+uploaded. Empty fixtures keep their world mod lists vanilla. Imported saves preserve published
+dependencies; staging a Magnetar package removes only a matching unpublished duplicate from the
+isolated copy. Treat the human game client as a separate compatibility boundary: server-side
+session logic can run headlessly, but joining a world containing custom block definitions still
+requires matching definitions on the client.
