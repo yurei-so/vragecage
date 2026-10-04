@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 LAB_FILE = ".vragecage-lab.json"
 ACTIVE_FILE = ".vragecage-active-run.json"
 PENDING_FILE = ".vragecage-pending-command.json"
+LOCK_FILE = ".vragecage-lab.lock"
 
 
 def canonical(value: object) -> bytes:
@@ -41,12 +43,15 @@ def load_object(path: Path) -> dict[str, object]:
 
 
 def ensure_instance(instance: Path) -> tuple[Path, dict[str, object]]:
+    if instance.is_symlink():
+        raise SystemExit("lab instance must not be a symbolic link")
     instance = instance.resolve()
-    world = (instance / "World").resolve()
+    world_path = instance / "World"
+    if world_path.is_symlink():
+        raise SystemExit("lab world must not be a symbolic link")
+    world = world_path.resolve()
     if world.parent != instance or not world.is_dir():
         raise SystemExit("lab world must be the instance's direct World directory")
-    if instance.is_symlink() or world.is_symlink():
-        raise SystemExit("lab instance and world must not be symbolic links")
     imported = load_object(instance / ".vragecage-world-import.json")
     if imported.get("instance") != instance.name or imported.get("tree_sha256") is None:
         raise SystemExit("lab authority requires a matching world-import receipt")
@@ -86,6 +91,8 @@ def validate(instance: Path) -> tuple[dict[str, object], dict[str, object]]:
 
 
 def create(instance: Path) -> dict[str, object]:
+    if instance.is_symlink():
+        raise SystemExit("lab instance must not be a symbolic link")
     instance = instance.resolve()
     world, imported = ensure_instance(instance)
     if (instance / LAB_FILE).exists():
@@ -109,10 +116,15 @@ def create(instance: Path) -> dict[str, object]:
 
 
 def activate(instance: Path) -> dict[str, object]:
+    if instance.is_symlink():
+        raise SystemExit("lab instance must not be a symbolic link")
     instance = instance.resolve()
     contract, _ = validate(instance)
-    quarantine = (instance / str(contract["quarantine"])).resolve()
-    if quarantine.parent != instance or quarantine.is_symlink():
+    quarantine_path = instance / str(contract["quarantine"])
+    if quarantine_path.is_symlink():
+        raise SystemExit("lab quarantine must not be a symbolic link")
+    quarantine = quarantine_path.resolve()
+    if quarantine.parent != instance:
         raise SystemExit("lab quarantine must be a direct, non-symlink instance directory")
     quarantine.mkdir(mode=0o700, exist_ok=True)
     run_id = secrets.token_hex(16)
@@ -165,6 +177,8 @@ def validate_drive_command(command: dict[str, object], contract: dict[str, objec
 
 
 def plan_drive(instance: Path, controller_id: int, distance: float, speed: float, ticks: int) -> dict[str, object]:
+    if instance.is_symlink():
+        raise SystemExit("lab instance must not be a symbolic link")
     instance = instance.resolve()
     contract, _ = validate(instance)
     pending = instance / PENDING_FILE
@@ -181,17 +195,33 @@ def plan_drive(instance: Path, controller_id: int, distance: float, speed: float
         "timeout_ticks": ticks,
     }
     validate_drive_command(command, contract)
-    atomic_write(pending, command)
+    try:
+        descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise SystemExit("a lab command is already pending")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical(command))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        pending.unlink(missing_ok=True)
+        raise
     return command
 
 
 def verify_runtime(instance: Path, run_id: str) -> dict[str, object]:
+    if instance.is_symlink():
+        raise SystemExit("lab instance must not be a symbolic link")
     instance = instance.resolve()
     contract, _ = validate(instance)
     active = load_object(instance / ACTIVE_FILE)
     if active.get("run_id") != run_id or active.get("fixture_id") != contract.get("fixture_id"):
         raise SystemExit("active lab run does not match launch authority")
-    quarantine = Path(str(active.get("quarantine", ""))).resolve()
+    quarantine_path = Path(str(active.get("quarantine", "")))
+    if quarantine_path.is_symlink():
+        raise SystemExit("active lab quarantine must not be a symbolic link")
+    quarantine = quarantine_path.resolve()
     expected_parent = (instance / str(contract["quarantine"])).resolve()
     if quarantine.parent != expected_parent or quarantine.name != run_id or not quarantine.is_dir():
         raise SystemExit("active lab run has an invalid quarantine directory")
@@ -215,14 +245,20 @@ def main() -> int:
     drive.add_argument("--timeout-ticks", type=int, required=True)
     args = parser.parse_args()
     instance = Path(args.instance).expanduser()
-    if args.command == "create":
-        result = create(instance)
-    elif args.command == "activate":
-        result = activate(instance)
-    elif args.command == "verify-runtime":
-        result = verify_runtime(instance, args.run_id)
-    else:
-        result = plan_drive(instance, args.controller_id, args.distance, args.max_speed, args.timeout_ticks)
+    if not instance.is_dir():
+        raise SystemExit("lab instance directory does not exist")
+    lock_path = instance / LOCK_FILE
+    with lock_path.open("a+b") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.command == "create":
+            result = create(instance)
+        elif args.command == "activate":
+            result = activate(instance)
+        elif args.command == "verify-runtime":
+            result = verify_runtime(instance, args.run_id)
+        else:
+            result = plan_drive(instance, args.controller_id, args.distance, args.max_speed, args.timeout_ticks)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 

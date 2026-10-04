@@ -179,9 +179,30 @@ assert len(active["command_sha256"]) == 64
 assert not (instance / ".vragecage-pending-command.json").exists()
 assert (Path(active["quarantine"]) / "command.json").is_file()
 PY
+(set +e; "$repo_root/worker/lab-contract.py" plan-drive \
+  "$worker_root/instances/imported" 12345 --distance 1 --max-speed 1 --timeout-ticks 600 \
+  >/dev/null 2>&1; printf '%s\n' "$?" > "$temporary/plan-a.status") &
+plan_a=$!
+(set +e; "$repo_root/worker/lab-contract.py" plan-drive \
+  "$worker_root/instances/imported" 12345 --distance 1 --max-speed 1 --timeout-ticks 600 \
+  >/dev/null 2>&1; printf '%s\n' "$?" > "$temporary/plan-b.status") &
+plan_b=$!
+wait "$plan_a" "$plan_b"
+if [[ "$(grep -h '^0$' "$temporary/plan-a.status" "$temporary/plan-b.status" | wc -l)" != 1 ]]; then
+  echo "concurrent lab command planning did not accept exactly one writer" >&2
+  exit 1
+fi
+rm "$worker_root/instances/imported/.vragecage-pending-command.json"
 VRAGECAGE_WORKER_ROOT="$worker_root" \
   "$repo_root/worker/lab-contract.py" verify-runtime \
     "$worker_root/instances/imported" "$run_id" >/dev/null
+ln -s imported "$worker_root/instances/imported-link"
+if "$repo_root/worker/lab-contract.py" verify-runtime \
+    "$worker_root/instances/imported-link" "$run_id" >/dev/null 2>&1; then
+  echo "lab runtime verification accepted a symlinked instance" >&2
+  exit 1
+fi
+rm "$worker_root/instances/imported-link"
 if "$repo_root/worker/lab-contract.py" verify-runtime \
     "$worker_root/instances/imported" wrong-run >/dev/null 2>&1; then
   echo "lab runtime verification accepted a mismatched run identity" >&2
