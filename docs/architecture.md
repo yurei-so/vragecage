@@ -96,6 +96,7 @@ Automate correctness, authority, lifecycle, recovery, and reproducibility. Keep 
 
 - whether vehicle behavior feels competent and predictable;
 - UI, terminal controls, models, GPS/debug rendering, and accessibility;
+- interpretation of camera-attached evidence from the separately gated [render-trial client](render-trials.md);
 - architecture, safety boundaries, feature intent, and the final definition of useful behavior.
 
 ## Stages
