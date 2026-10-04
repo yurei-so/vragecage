@@ -82,14 +82,22 @@ def grids(tree: ET.ElementTree) -> list[dict[str, object]]:
         if entity.get(XSI_TYPE) != "MyObjectBuilder_CubeGrid":
             continue
         controllers = []
+        cameras = []
         blocks = entity.find("CubeBlocks")
         for block in list(blocks) if blocks is not None else []:
-            if block.get(XSI_TYPE) != "MyObjectBuilder_RemoteControl":
+            block_id = block.findtext("EntityId")
+            if not block_id or not block_id.isdigit():
                 continue
-            controller_id = block.findtext("EntityId")
-            if controller_id and controller_id.isdigit():
+            if block.get(XSI_TYPE) == "MyObjectBuilder_RemoteControl":
                 controllers.append({
-                    "entity_id": int(controller_id),
+                    "entity_id": int(block_id),
+                    "entity_name": block.findtext("Name"),
+                    "custom_name": block.findtext("CustomName"),
+                    "subtype": block.findtext("SubtypeName"),
+                })
+            elif block.get(XSI_TYPE) == "MyObjectBuilder_CameraBlock":
+                cameras.append({
+                    "entity_id": int(block_id),
                     "entity_name": block.findtext("Name"),
                     "custom_name": block.findtext("CustomName"),
                     "subtype": block.findtext("SubtypeName"),
@@ -101,6 +109,7 @@ def grids(tree: ET.ElementTree) -> list[dict[str, object]]:
             "static": entity.findtext("IsStatic") == "true",
             "block_count": len(list(blocks)) if blocks is not None else 0,
             "remote_controls": controllers,
+            "cameras": cameras,
         })
     return result
 

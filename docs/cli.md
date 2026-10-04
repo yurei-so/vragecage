@@ -30,7 +30,7 @@ configuration and keeps the worker address explicit.
 | `stage-plugin NAME PATH --id PLUGIN` | Atomically copy and register a Magnetar lab plugin | Yes |
 | `stage-world NAME PATH [--engine ENGINE] [--destructive-lab]` | Copy a local save into a new guarded instance with a content receipt | Yes |
 | `lab-drive NAME CONTROLLER_ID` | Queue one bounded, one-shot drive command for the next lab run | Yes |
-| `fixture-inspect NAME` | Read grids, Remote Controls, and player GPS targets from a lab copy | No |
+| `fixture-inspect NAME` | Read grids, Remote Controls, camera blocks, and player GPS targets from a lab copy | No |
 | `fixture-opt-in NAME CONTROLLER_ID [--label LABEL]` | Add the Voidwright opt-in marker to one copied-world Remote Control | Yes |
 
 `stage-mod` does not publish the package. On the official Steam multiplayer server, a local

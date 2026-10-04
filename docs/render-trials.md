@@ -19,18 +19,26 @@ not sufficient.
    frame count, and maximum lifetime. Bind the request hash to the lab run receipt.
 3. Launch an ordinary Space Engineers client through Steam/Proton and join only the configured lab
    endpoint. Do not reuse the server's universal harness identity for the client.
-4. Load a client-only render-witness plugin. After the client has joined the expected run, it locates
+4. Load a client-only render-witness bridge. After the client has joined the expected run, it locates
    the exact camera entity, verifies that it is functional and belongs to the expected grid, and
    requests that camera's normal in-game view on the client thread.
-5. Wait a fixed number of rendered frames. The external supervisor captures only the game window,
-   writes the image atomically, and hashes it. The plugin emits camera entity ID, grid ID, pose, FOV,
-   run nonce, and frame/time evidence; it does not drive blocks or accept general input.
+5. Wait a fixed number of rendered frames. Prefer the game's native screenshot path and have the
+   supervisor claim exactly one newly created file; a game-window capture is a bounded fallback if
+   the installed build exposes no stable screenshot call. The client resolution supplies the cheap
+   low-resolution render, so the bridge never implements a graphics pipeline or reads arbitrary GPU
+   memory. The bridge emits camera entity ID, grid ID, pose, FOV, run nonce, and frame/time evidence;
+   it does not drive blocks or accept general input.
 6. Stop the client and server cleanly. The terminal receipt binds the server receipt, client log,
    render request, plugin evidence, PNG hash/dimensions, and shutdown outcomes separately.
 
 The camera block is a suitable anchor because the game implements it as a camera controller and its
 normal `RequestSetView` path installs the block as the current local camera. This is client-side
 presentation state; attaching the view does not need to grant grid-control authority.
+
+A normal sandboxed session mod can identify cameras and switch ordinary game state, but the public
+ModAPI does not expose camera pixels as an image buffer. The witness should therefore be a narrowly
+scoped client plugin/bridge around the game's existing camera and screenshot paths, not a replacement
+renderer and not a server mod pretending the dedicated null renderer has frames.
 
 ## Boundaries
 
@@ -92,4 +100,3 @@ that is a later oracle or human-review decision.
    image comparisons as an automated oracle.
 5. **Remote render worker:** only after the local path is reliable, provision a licensed graphical
    client on a GPU worker and preserve the same request/receipt contract.
-
