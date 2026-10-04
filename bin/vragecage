@@ -430,6 +430,24 @@ def command_lab_drive(args: argparse.Namespace) -> int:
     ])
 
 
+def command_fixture_inspect(args: argparse.Namespace) -> int:
+    return run_checked([
+        script("fixture-contract.py"), "inspect", str(instance_path(args.instance)),
+    ])
+
+
+def command_fixture_opt_in(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to edit a fixture while instance is running: {args.instance}")
+    argv = [
+        script("fixture-contract.py"), "opt-in-voidwright",
+        str(instance_path(args.instance)), str(args.controller_id),
+    ]
+    if args.label:
+        argv.extend(["--label", args.label])
+    return run_checked(argv)
+
+
 def worker_main(args: argparse.Namespace) -> int:
     commands = {
         "doctor": command_doctor,
@@ -444,6 +462,8 @@ def worker_main(args: argparse.Namespace) -> int:
         "register-plugin": command_register_plugin,
         "import-world": command_import_world,
         "lab-drive": command_lab_drive,
+        "fixture-inspect": command_fixture_inspect,
+        "fixture-opt-in": command_fixture_opt_in,
     }
     return commands[args.command](args)
 
@@ -527,6 +547,10 @@ def client_main(args: argparse.Namespace) -> int:
             str(args.controller_id), "--distance", str(args.distance),
             "--max-speed", str(args.max_speed), "--timeout-ticks", str(args.timeout_ticks),
         ])
+    if args.command == "fixture-opt-in":
+        forwarded.append(str(args.controller_id))
+        if args.label:
+            forwarded.extend(["--label", args.label])
     remote = f"python3 ~/{REMOTE_CLI} {shlex.join(forwarded)}"
     return subprocess.run(["ssh", "-F", "/dev/null", host, remote]).returncode
 
@@ -602,6 +626,16 @@ def parser() -> argparse.ArgumentParser:
     drive.add_argument("--distance", type=float, default=3.0)
     drive.add_argument("--max-speed", type=float, default=2.0)
     drive.add_argument("--timeout-ticks", type=int, default=600)
+    fixture_inspect = subparsers.add_parser(
+        "fixture-inspect", help="inspect grids, Remote Controls, and GPS targets in a lab fixture"
+    )
+    fixture_inspect.add_argument("instance", type=validate_instance)
+    fixture_opt_in = subparsers.add_parser(
+        "fixture-opt-in", help="opt one copied-world Remote Control into Voidwright"
+    )
+    fixture_opt_in.add_argument("instance", type=validate_instance)
+    fixture_opt_in.add_argument("controller_id", type=int)
+    fixture_opt_in.add_argument("--label", type=validate_observation_requirement)
     return result
 
 

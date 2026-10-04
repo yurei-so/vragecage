@@ -30,6 +30,8 @@ configuration and keeps the worker address explicit.
 | `stage-plugin NAME PATH --id PLUGIN` | Atomically copy and register a Magnetar lab plugin | Yes |
 | `stage-world NAME PATH [--engine ENGINE] [--destructive-lab]` | Copy a local save into a new guarded instance with a content receipt | Yes |
 | `lab-drive NAME CONTROLLER_ID` | Queue one bounded, one-shot drive command for the next lab run | Yes |
+| `fixture-inspect NAME` | Read grids, Remote Controls, and player GPS targets from a lab copy | No |
+| `fixture-opt-in NAME CONTROLLER_ID [--label LABEL]` | Add the Voidwright opt-in marker to one copied-world Remote Control | Yes |
 
 `stage-mod` does not publish the package. On the official Steam multiplayer server, a local
 `PublishedFileId=0` entry is rejected before compilation with `Local mods are not allowed in
@@ -59,6 +61,12 @@ plugin source, Magnetar source/profile documents, and a hash receipt. `lab-drive
 for a positive controller entity ID, 0.25-25 meter distance, 0.1-5 m/s speed, and 60-3600 tick
 timeout. Launch activation moves the command into that run's quarantine, so failed or completed
 commands are never silently replayed by a later run.
+
+`fixture-inspect` exposes bounded structural metadata from the disposable copy without starting the
+engine. `fixture-opt-in` is the only offline sector mutation currently supported: while the service
+is stopped, it identifies exactly one Remote Control by positive entity ID and prefixes its copied
+name with `[Voidwright]`. The source save is untouched. The sector hashes before and after the edit,
+controller/grid IDs, names, operation ID, and timestamp are appended to a fixture-bound edit ledger.
 
 `--engine` is selected at `prepare` time (`proton`, the default, or `magnetar`) and persisted in
 `.vragecage-engine`. Follow-up commands read that marker. Magnetar stages a name-derived synthetic
@@ -106,6 +114,8 @@ When a destructive-lab run carries a command, the same receipt remains non-passi
 plugin evidence reaches the successful `complete` terminal state. Accepted, acquired, and running
 events prove progress only; timeout, controller loss/unavailability, and unsupported-controller are
 terminal failures. Server readiness and operation completion are deliberately separate facts.
+If an offline fixture edit ledger exists, receipts also require its identity, hash chain, and current
+sector hash to agree; an edited copy cannot pass after an unreceipted sector replacement.
 
 A staged package may declare an optional bounded `observation_prefix` in
 `vragecage.integration.json`. Matching log payloads are deduplicated and returned as at most 32

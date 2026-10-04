@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -76,6 +77,8 @@ def main() -> int:
     lab = json.loads((instance / ".vragecage-lab.json").read_text())
     if lab.get("authority") != "destructive-lab" or lab.get("instance") != instance.name:
         raise SystemExit("plugin staging requires a destructive-lab instance")
+    lock_stream = (instance / ".vragecage-stage.lock").open("a+b")
+    fcntl.flock(lock_stream, fcntl.LOCK_EX)
     manifests = [path for path in source.glob("*.xml") if path.is_file()]
     if len(manifests) != 1:
         raise SystemExit("plugin source must contain exactly one root XML manifest")

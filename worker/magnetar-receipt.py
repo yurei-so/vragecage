@@ -33,6 +33,12 @@ def first(pattern: str, text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def file_hash(path: Path) -> str | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def unique_bounded(lines: list[str], limit: int = 16) -> tuple[list[str], int]:
     # Timestamps make repeated engine diagnostics textually unique. Receipts
     # bind the full log by hash, so keep only the stable payload after `->`.
@@ -120,6 +126,9 @@ def main() -> int:
     quarantine_run = None
     lab_contract_sha256 = None
     lab_operation_id = None
+    fixture_edit_ledger_sha256 = None
+    fixture_edits_valid = None
+    fixture_edit_count = 0
     if lab_present and lab_path.is_file() and active_path.is_file():
         lab_raw = lab_path.read_bytes()
         try:
@@ -165,6 +174,41 @@ def main() -> int:
                 if (isinstance(operation_id, str) and len(operation_id) == 32
                         and all(character in "0123456789abcdef" for character in operation_id)):
                     lab_operation_id = operation_id
+                ledger_path = instance / ".vragecage-fixture-edits.json"
+                if ledger_path.exists():
+                    fixture_edit_ledger_sha256 = file_hash(ledger_path)
+                    try:
+                        ledger = json.loads(ledger_path.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        ledger = None
+                    edits = ledger.get("edits") if isinstance(ledger, dict) else None
+                    fixture_edit_count = len(edits) if isinstance(edits, list) else 0
+                    chain_valid = isinstance(edits, list) and all(
+                        isinstance(edit, dict)
+                        and edit.get("action") == "voidwright-opt-in"
+                        and isinstance(edit.get("operation_id"), str)
+                        and len(edit["operation_id"]) == 32
+                        and all(character in "0123456789abcdef" for character in edit["operation_id"])
+                        and isinstance(edit.get("sector_sha256_before"), str)
+                        and isinstance(edit.get("sector_sha256_after"), str)
+                        for edit in edits
+                    )
+                    if chain_valid:
+                        chain_valid = all(
+                            edits[index - 1]["sector_sha256_after"] == edits[index]["sector_sha256_before"]
+                            for index in range(1, len(edits))
+                        )
+                    current_sector_hash = file_hash(instance / "World/SANDBOX_0_0_0_.sbs")
+                    fixture_edits_valid = bool(
+                        fixture_edit_ledger_sha256
+                        and isinstance(ledger, dict)
+                        and ledger.get("schema") == "vragecage.fixture-edits.v1"
+                        and ledger.get("instance") == instance.name
+                        and ledger.get("fixture_id") == lab.get("fixture_id")
+                        and ledger.get("source_tree_sha256") == lab.get("source_tree_sha256")
+                        and chain_valid and edits
+                        and edits[-1].get("sector_sha256_after") == current_sector_hash
+                    )
     lab_operation_events: list[str] = []
     lab_operation_status = None
     if lab_operation_id:
@@ -227,6 +271,9 @@ def main() -> int:
         "lab_operation_status": lab_operation_status,
         "lab_operation_terminal": lab_operation_terminal,
         "lab_operation_events": lab_operation_events,
+        "fixture_edit_ledger_sha256": fixture_edit_ledger_sha256,
+        "fixture_edit_count": fixture_edit_count,
+        "fixture_edits_valid": fixture_edits_valid,
     }
     receipt["passed"] = bool(
         receipt["session_loaded"]
@@ -238,6 +285,7 @@ def main() -> int:
         and (stage is None or (definitions_loaded and scripts_loaded and stage_unchanged))
         and (plugin_stage is None or plugin_unchanged)
         and (lab_operation_id is None or lab_operation_status == "complete")
+        and (fixture_edits_valid is not False)
     )
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return 0 if receipt["passed"] else 1

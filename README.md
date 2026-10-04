@@ -69,6 +69,8 @@ vragecage stage-world voidwright-lab "/path/to/Space Engineers Save" \
   --engine magnetar --engine-ready --destructive-lab
 vragecage stage-plugin voidwright-lab /path/to/Voidwright/ServerPlugin \
   --id voidwright-server-plugin
+vragecage fixture-inspect voidwright-lab
+vragecage fixture-opt-in voidwright-lab CONTROLLER_ENTITY_ID --label "Camera Drone"
 vragecage lab-drive voidwright-lab CONTROLLER_ENTITY_ID --distance 2 --max-speed 1
 vragecage stage-mod voidwright-native /path/to/Voidwright --name Voidwright
 vragecage run voidwright-native

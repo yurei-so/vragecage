@@ -122,9 +122,9 @@ assert ET.parse(instance / "SpaceEngineers-Dedicated.cfg").getroot().findtext("L
 PY
 
 mkdir -p "$worker_root/incoming/imported-world"
-printf '<Checkpoint><Mods><ModItem><Name>TestMod</Name></ModItem><ModItem><Name>Published</Name><PublishedFileId>123</PublishedFileId></ModItem></Mods></Checkpoint>\n' > "$worker_root/incoming/imported-world/Sandbox.sbc"
+printf '<Checkpoint><Mods><ModItem><Name>TestMod</Name></ModItem><ModItem><Name>Published</Name><PublishedFileId>123</PublishedFileId></ModItem></Mods><Gps><dictionary><item><Key>42</Key><Value><Entries><Entry><name>Red Zone</name><description>test target</description><coords><X>1</X><Y>2</Y><Z>3</Z></coords></Entry></Entries></Value></item></dictionary></Gps></Checkpoint>\n' > "$worker_root/incoming/imported-world/Sandbox.sbc"
 printf '<WorldConfiguration><Mods><ModItem><Name>TestMod</Name><PublishedFileId>0</PublishedFileId></ModItem><ModItem><Name>Published</Name><PublishedFileId>123</PublishedFileId></ModItem></Mods></WorldConfiguration>\n' > "$worker_root/incoming/imported-world/Sandbox_config.sbc"
-printf '<Sector />\n' > "$worker_root/incoming/imported-world/SANDBOX_0_0_0_.sbs"
+printf '<Sector xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><SectorObjects><MyObjectBuilder_EntityBase xsi:type="MyObjectBuilder_CubeGrid"><EntityId>9001</EntityId><DisplayName>Camera Drone</DisplayName><GridSizeEnum>Small</GridSizeEnum><CubeBlocks><MyObjectBuilder_CubeBlock xsi:type="MyObjectBuilder_RemoteControl"><EntityId>12345</EntityId><SubtypeName>SmallBlockRemoteControl</SubtypeName></MyObjectBuilder_CubeBlock></CubeBlocks></MyObjectBuilder_EntityBase></SectorObjects></Sector>\n' > "$worker_root/incoming/imported-world/SANDBOX_0_0_0_.sbs"
 VRAGECAGE_WORKER_ROOT="$worker_root" VRAGECAGE_BIND_IP=0.0.0.0 \
 VRAGECAGE_ALLOW_NON_LOOPBACK=1 \
   "$repo_root/worker/import-world.py" imported "$worker_root/incoming/imported-world" \
@@ -209,6 +209,42 @@ if "$repo_root/worker/lab-contract.py" verify-runtime \
   echo "lab runtime verification accepted a mismatched run identity" >&2
   exit 1
 fi
+inspection="$($repo_root/worker/fixture-contract.py inspect "$worker_root/instances/imported")"
+python3 - "$inspection" <<'PY'
+import json
+import sys
+
+result = json.loads(sys.argv[1])
+assert result["grids"][0]["name"] == "Camera Drone"
+assert result["grids"][0]["remote_controls"][0]["entity_id"] == 12345
+assert result["gps_targets"] == [{"description": "test target", "name": "Red Zone", "x": 1.0, "y": 2.0, "z": 3.0}]
+PY
+opt_in="$($repo_root/worker/fixture-contract.py opt-in-voidwright \
+  "$worker_root/instances/imported" 12345 --label 'Camera Drone')"
+python3 - "$opt_in" "$worker_root/instances/imported" <<'PY'
+import json
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+result = json.loads(sys.argv[1])
+instance = Path(sys.argv[2])
+assert result["status"] == "opted_in"
+assert result["edit"]["new_name"] == "[Voidwright] Camera Drone"
+assert len(result["edit_ledger_sha256"]) == 64
+tree = ET.parse(instance / "World/SANDBOX_0_0_0_.sbs")
+block = tree.getroot().find(".//MyObjectBuilder_CubeBlock")
+assert block.findtext("CustomName") == "[Voidwright] Camera Drone"
+ledger = json.loads((instance / ".vragecage-fixture-edits.json").read_text())
+assert len(ledger["edits"]) == 1
+PY
+already="$($repo_root/worker/fixture-contract.py opt-in-voidwright \
+  "$worker_root/instances/imported" 12345 --label 'Camera Drone')"
+python3 - "$already" <<'PY'
+import json
+import sys
+assert json.loads(sys.argv[1])["status"] == "already_opted_in"
+PY
 if VRAGECAGE_WORKER_ROOT="$worker_root" \
     "$repo_root/worker/import-world.py" invalid-lab "$worker_root/incoming/imported-world" \
       --engine proton --destructive-lab >/dev/null 2>&1; then
