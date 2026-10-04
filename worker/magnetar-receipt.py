@@ -124,24 +124,36 @@ def main() -> int:
         try:
             lab = json.loads(lab_raw)
             active = json.loads(active_path.read_text())
+            imported = json.loads((instance / ".vragecage-world-import.json").read_text())
         except (json.JSONDecodeError, OSError):
-            lab = active = None
-        if isinstance(lab, dict) and isinstance(active, dict):
+            lab = active = imported = None
+        if isinstance(lab, dict) and isinstance(active, dict) and isinstance(imported, dict):
             lab_contract_sha256 = hashlib.sha256(lab_raw).hexdigest()
             run_id = active.get("run_id")
-            quarantine = Path(str(active.get("quarantine", "")))
+            quarantine_path = Path(str(active.get("quarantine", "")))
+            quarantine = quarantine_path.resolve()
             expected_parent = (instance / "Quarantine").resolve()
             lab_valid = bool(
                 lab.get("schema") == "vragecage.lab-authority.v1"
                 and lab.get("authority") == "destructive-lab"
                 and lab.get("disposable") is True
+                and lab.get("instance") == instance.name
+                and lab.get("engine") == "magnetar"
+                and lab.get("source_tree_sha256") == imported.get("tree_sha256")
+                and imported.get("instance") == instance.name
+                and imported.get("engine") == "magnetar"
                 and active.get("schema") == "vragecage.lab-run.v1"
                 and active.get("authority") == "destructive-lab"
+                and active.get("instance") == instance.name
                 and active.get("fixture_id") == lab.get("fixture_id")
                 and active.get("contract_sha256") == lab_contract_sha256
                 and isinstance(run_id, str)
+                and len(run_id) == 32
+                and all(character in "0123456789abcdef" for character in run_id)
+                and not quarantine_path.is_symlink()
                 and quarantine.resolve().parent == expected_parent
                 and quarantine.name == run_id
+                and quarantine.is_dir()
             )
             if lab_valid:
                 lab_authority = "destructive-lab"

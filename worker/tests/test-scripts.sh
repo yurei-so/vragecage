@@ -299,6 +299,38 @@ if "$repo_root/worker/register-magnetar-plugin.py" \
 fi
 rm "$plugin_source/unsafe-link"
 
+printf '%s\n' \
+  "2026 [INFO] Loading client mod scripts for $workshop_id" \
+  "2026 [INFO] Loading client mod definitions for $workshop_id" \
+  '2026 [INFO] TestMod bootstrap complete' \
+  '2026 [INFO] Test plugin ready' \
+  > "$worker_root/instances/imported/MagnetarConfig/info_20261003_000000.log"
+printf '%s\n' \
+  '2026 - Thread: 1 -> App Version: 01_210_014' \
+  '2026 - Thread: 1 -> Session loaded' \
+  '2026 - Thread: 1 -> Game ready...' \
+  > "$worker_root/instances/imported/SpaceEngineersDedicated_20261003_000000000.log"
+lab_receipt="$($repo_root/worker/magnetar-receipt.py "$worker_root/instances/imported")"
+python3 - "$lab_receipt" "$run_id" <<'PY'
+import json
+import sys
+
+receipt = json.loads(sys.argv[1])
+assert receipt["passed"] is True
+assert receipt["lab_contract_valid"] is True
+assert receipt["lab_run_id"] == sys.argv[2]
+PY
+mv "$worker_root/instances/imported/Quarantine/$run_id" \
+  "$worker_root/instances/imported/Quarantine/run-backup"
+ln -s run-backup "$worker_root/instances/imported/Quarantine/$run_id"
+if "$repo_root/worker/magnetar-receipt.py" "$worker_root/instances/imported" >/dev/null 2>&1; then
+  echo "Magnetar receipt accepted a symlinked lab quarantine" >&2
+  exit 1
+fi
+rm "$worker_root/instances/imported/Quarantine/$run_id"
+mv "$worker_root/instances/imported/Quarantine/run-backup" \
+  "$worker_root/instances/imported/Quarantine/$run_id"
+
 mkdir -p "$temporary/fake-bin"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$temporary/fake-bin/systemctl"
 chmod +x "$temporary/fake-bin/systemctl"

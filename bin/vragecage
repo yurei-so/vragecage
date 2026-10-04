@@ -113,7 +113,8 @@ def read_receipt(instance: str) -> tuple[dict[str, object] | None, int]:
 
 
 def persist_quarantine_receipt(instance: str, receipt: dict[str, object] | None) -> dict[str, object] | None:
-    if receipt is None or receipt.get("lab_authority") != "destructive-lab":
+    if (receipt is None or receipt.get("lab_authority") != "destructive-lab"
+            or receipt.get("lab_contract_valid") is not True):
         return None
     root = instance_path(instance).resolve()
     active_path = root / ".vragecage-active-run.json"
@@ -122,9 +123,15 @@ def persist_quarantine_receipt(instance: str, receipt: dict[str, object] | None)
     except (OSError, json.JSONDecodeError):
         return None
     run_id = receipt.get("lab_run_id")
-    quarantine = Path(str(active.get("quarantine", ""))).resolve()
-    if active.get("run_id") != run_id or quarantine.parent != (root / "Quarantine").resolve():
+    if (not isinstance(run_id, str) or len(run_id) != 32
+            or any(character not in "0123456789abcdef" for character in run_id)):
         return None
+    quarantine_path = Path(str(active.get("quarantine", "")))
+    expected = root / "Quarantine" / run_id
+    if (active.get("run_id") != run_id or quarantine_path.is_symlink()
+            or quarantine_path != expected or not quarantine_path.is_dir()):
+        return None
+    quarantine = quarantine_path.resolve()
     receipt_bytes = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
     envelope = {
         "schema": "vragecage.lab-terminal-receipt.v1",
@@ -134,6 +141,14 @@ def persist_quarantine_receipt(instance: str, receipt: dict[str, object] | None)
     }
     encoded = (json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n").encode()
     path = quarantine / "terminal-receipt.json"
+    if path.exists():
+        existing = path.read_bytes()
+        if existing != encoded:
+            raise SystemExit("refusing to replace a different lab terminal receipt")
+        return {
+            "path": f"Quarantine/{run_id}/terminal-receipt.json",
+            "sha256": hashlib.sha256(existing).hexdigest(),
+        }
     temporary = path.with_suffix(".tmp")
     temporary.write_bytes(encoded)
     os.chmod(temporary, 0o600)
