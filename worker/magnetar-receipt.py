@@ -119,6 +119,7 @@ def main() -> int:
     lab_run_id = None
     quarantine_run = None
     lab_contract_sha256 = None
+    lab_operation_id = None
     if lab_present and lab_path.is_file() and active_path.is_file():
         lab_raw = lab_path.read_bytes()
         try:
@@ -159,6 +160,27 @@ def main() -> int:
                 lab_authority = "destructive-lab"
                 lab_run_id = run_id
                 quarantine_run = f"Quarantine/{run_id}"
+                command = active.get("command")
+                operation_id = command.get("operation_id") if isinstance(command, dict) else None
+                if (isinstance(operation_id, str) and len(operation_id) == 32
+                        and all(character in "0123456789abcdef" for character in operation_id)):
+                    lab_operation_id = operation_id
+    lab_operation_events: list[str] = []
+    lab_operation_status = None
+    if lab_operation_id:
+        operation_pattern = re.compile(
+            r"Voidwright evidence: type=server-control operation="
+            + re.escape(lab_operation_id) + r"\b.*\bstatus=([a-z-]+)"
+        )
+        for line in all_lines:
+            match = operation_pattern.search(line)
+            if match:
+                lab_operation_events.append(line.split("->", 1)[-1].strip())
+                lab_operation_status = match.group(1)
+        lab_operation_events = list(dict.fromkeys(lab_operation_events))[-32:]
+    lab_operation_terminal = lab_operation_status in {
+        "complete", "timeout", "controller-unavailable", "controller-lost", "unsupported-controller"
+    }
     receipt = {
         "schema": "vragecage.magnetar-receipt.v1",
         "engine": "magnetar",
@@ -201,6 +223,10 @@ def main() -> int:
         "lab_contract_valid": lab_valid,
         "lab_run_id": lab_run_id,
         "quarantine_run": quarantine_run,
+        "lab_operation_id": lab_operation_id,
+        "lab_operation_status": lab_operation_status,
+        "lab_operation_terminal": lab_operation_terminal,
+        "lab_operation_events": lab_operation_events,
     }
     receipt["passed"] = bool(
         receipt["session_loaded"]
@@ -211,6 +237,7 @@ def main() -> int:
         and (not lab_present or lab_valid)
         and (stage is None or (definitions_loaded and scripts_loaded and stage_unchanged))
         and (plugin_stage is None or plugin_unchanged)
+        and (lab_operation_id is None or lab_operation_status == "complete")
     )
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return 0 if receipt["passed"] else 1

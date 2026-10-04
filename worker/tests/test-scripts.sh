@@ -166,6 +166,7 @@ if "$repo_root/worker/lab-contract.py" plan-drive \
 fi
 active="$($repo_root/worker/lab-contract.py activate "$worker_root/instances/imported")"
 run_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["run_id"])' "$active")"
+operation_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["command"]["operation_id"])' "$active")"
 python3 - "$command" "$active" "$worker_root/instances/imported" <<'PY'
 import json
 import sys
@@ -304,12 +305,29 @@ printf '%s\n' \
   "2026 [INFO] Loading client mod definitions for $workshop_id" \
   '2026 [INFO] TestMod bootstrap complete' \
   '2026 [INFO] Test plugin ready' \
+  "2026 [INFO] Voidwright evidence: type=server-control operation=$operation_id controllerId=12345 status=accepted" \
   > "$worker_root/instances/imported/MagnetarConfig/info_20261003_000000.log"
 printf '%s\n' \
   '2026 - Thread: 1 -> App Version: 01_210_014' \
   '2026 - Thread: 1 -> Session loaded' \
   '2026 - Thread: 1 -> Game ready...' \
   > "$worker_root/instances/imported/SpaceEngineersDedicated_20261003_000000000.log"
+if incomplete_lab_receipt="$($repo_root/worker/magnetar-receipt.py "$worker_root/instances/imported")"; then
+  echo "Magnetar receipt passed before the lab operation completed" >&2
+  exit 1
+fi
+python3 - "$incomplete_lab_receipt" "$operation_id" <<'PY'
+import json
+import sys
+
+receipt = json.loads(sys.argv[1])
+assert receipt["lab_operation_id"] == sys.argv[2]
+assert receipt["lab_operation_status"] == "accepted"
+assert receipt["lab_operation_terminal"] is False
+PY
+printf '%s\n' \
+  "2026 [INFO] Voidwright evidence: type=server-control operation=$operation_id controllerId=12345 status=complete elapsedTicks=90 displacement=1 speed=0" \
+  >> "$worker_root/instances/imported/MagnetarConfig/info_20261003_000000.log"
 lab_receipt="$($repo_root/worker/magnetar-receipt.py "$worker_root/instances/imported")"
 python3 - "$lab_receipt" "$run_id" <<'PY'
 import json
@@ -319,6 +337,8 @@ receipt = json.loads(sys.argv[1])
 assert receipt["passed"] is True
 assert receipt["lab_contract_valid"] is True
 assert receipt["lab_run_id"] == sys.argv[2]
+assert receipt["lab_operation_status"] == "complete"
+assert receipt["lab_operation_terminal"] is True
 PY
 mv "$worker_root/instances/imported/Quarantine/$run_id" \
   "$worker_root/instances/imported/Quarantine/run-backup"

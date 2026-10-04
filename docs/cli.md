@@ -102,6 +102,11 @@ hashes to the mod-stage receipt, current package tree hash, definition/script lo
 readiness, fatal errors, and separately observed shutdown state. A live receipt never claims a
 clean shutdown that has not happened yet.
 
+When a destructive-lab run carries a command, the same receipt remains non-passing until correlated
+plugin evidence reaches the successful `complete` terminal state. Accepted, acquired, and running
+events prove progress only; timeout, controller loss/unavailability, and unsupported-controller are
+terminal failures. Server readiness and operation completion are deliberately separate facts.
+
 A staged package may declare an optional bounded `observation_prefix` in
 `vragecage.integration.json`. Matching log payloads are deduplicated and returned as at most 32
 `observations`, with an explicit omitted count. The full source logs remain hash-bound; the compact
