@@ -19,6 +19,7 @@ LAB_FILE = ".vragecage-lab.json"
 ACTIVE_FILE = ".vragecage-active-run.json"
 PENDING_FILE = ".vragecage-pending-command.json"
 LOCK_FILE = ".vragecage-lab.lock"
+XSI_TYPE = "{http://www.w3.org/2001/XMLSchema-instance}type"
 
 
 def canonical(value: object) -> bytes:
@@ -90,6 +91,63 @@ def validate(instance: Path) -> tuple[dict[str, object], dict[str, object]]:
     return contract, imported
 
 
+def fixture_snapshot(instance: Path, contract: dict[str, object]) -> dict[str, object]:
+    ledger_path = instance / ".vragecage-fixture-edits.json"
+    if not ledger_path.exists():
+        return {}
+    if ledger_path.is_symlink() or not ledger_path.is_file():
+        raise SystemExit("fixture edit ledger must be a regular non-symlink file")
+    ledger_raw = ledger_path.read_bytes()
+    ledger = load_object(ledger_path)
+    edits = ledger.get("edits")
+    if (ledger.get("schema") != "vragecage.fixture-edits.v1"
+            or ledger.get("instance") != instance.name
+            or ledger.get("fixture_id") != contract.get("fixture_id")
+            or ledger.get("source_tree_sha256") != contract.get("source_tree_sha256")
+            or not isinstance(edits, list) or not edits):
+        raise SystemExit("fixture edit ledger does not match the active lab contract")
+    previous = None
+    expected_names: dict[int, str] = {}
+    operation_ids: set[str] = set()
+    for edit in edits:
+        if (not isinstance(edit, dict) or edit.get("action") != "voidwright-opt-in"
+                or edit.get("previous_operation_id") != previous
+                or not isinstance(edit.get("operation_id"), str)
+                or len(edit["operation_id"]) != 32
+                or any(character not in "0123456789abcdef" for character in edit["operation_id"])
+                or edit["operation_id"] in operation_ids
+                or not isinstance(edit.get("controller_id"), int)
+                or not isinstance(edit.get("new_name"), str)):
+            raise SystemExit("fixture edit ledger contains an invalid edit chain")
+        previous = edit["operation_id"]
+        operation_ids.add(previous)
+        expected_names[edit["controller_id"]] = edit["new_name"]
+    sector = instance / "World/SANDBOX_0_0_0_.sbs"
+    if sector.is_symlink() or not sector.is_file():
+        raise SystemExit("fixture sector must be a regular non-symlink file")
+    try:
+        tree = ET.parse(sector)
+    except ET.ParseError as error:
+        raise SystemExit(f"invalid fixture sector XML: {error}")
+    actual_names: dict[int, str] = {}
+    for block in tree.getroot().iter("MyObjectBuilder_CubeBlock"):
+        if block.get(XSI_TYPE) != "MyObjectBuilder_RemoteControl":
+            continue
+        entity_id = block.findtext("EntityId")
+        if entity_id and entity_id.isdigit():
+            actual_names[int(entity_id)] = block.findtext("CustomName") or ""
+    for controller_id, expected in expected_names.items():
+        if actual_names.get(controller_id) != expected:
+            raise SystemExit(
+                f"fixture edit outcome is not present for controller {controller_id}"
+            )
+    return {
+        "fixture_edit_ledger_sha256": hashlib.sha256(ledger_raw).hexdigest(),
+        "fixture_sector_sha256": hashlib.sha256(sector.read_bytes()).hexdigest(),
+        "fixture_edit_count": len(edits),
+    }
+
+
 def create(instance: Path) -> dict[str, object]:
     if instance.is_symlink():
         raise SystemExit("lab instance must not be a symbolic link")
@@ -140,6 +198,7 @@ def activate(instance: Path) -> dict[str, object]:
         "quarantine": str(run_directory),
         "contract_sha256": hashlib.sha256(canonical(contract)).hexdigest(),
     }
+    active.update(fixture_snapshot(instance, contract))
     pending_path = instance / PENDING_FILE
     if pending_path.is_file():
         command = load_object(pending_path)

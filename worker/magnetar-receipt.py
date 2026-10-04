@@ -129,6 +129,9 @@ def main() -> int:
     fixture_edit_ledger_sha256 = None
     fixture_edits_valid = None
     fixture_edit_count = 0
+    fixture_sector_sha256_at_activation = None
+    fixture_sector_sha256_current = None
+    fixture_sector_changed_by_engine = None
     if lab_present and lab_path.is_file() and active_path.is_file():
         lab_raw = lab_path.read_bytes()
         try:
@@ -183,22 +186,30 @@ def main() -> int:
                         ledger = None
                     edits = ledger.get("edits") if isinstance(ledger, dict) else None
                     fixture_edit_count = len(edits) if isinstance(edits, list) else 0
-                    chain_valid = isinstance(edits, list) and all(
-                        isinstance(edit, dict)
-                        and edit.get("action") == "voidwright-opt-in"
-                        and isinstance(edit.get("operation_id"), str)
-                        and len(edit["operation_id"]) == 32
-                        and all(character in "0123456789abcdef" for character in edit["operation_id"])
-                        and isinstance(edit.get("sector_sha256_before"), str)
-                        and isinstance(edit.get("sector_sha256_after"), str)
-                        for edit in edits
-                    )
+                    chain_valid = isinstance(edits, list) and bool(edits)
+                    previous_operation_id = None
+                    seen_operation_ids: set[str] = set()
                     if chain_valid:
-                        chain_valid = all(
-                            edits[index - 1]["sector_sha256_after"] == edits[index]["sector_sha256_before"]
-                            for index in range(1, len(edits))
-                        )
-                    current_sector_hash = file_hash(instance / "World/SANDBOX_0_0_0_.sbs")
+                        for edit in edits:
+                            operation = edit.get("operation_id") if isinstance(edit, dict) else None
+                            if (not isinstance(edit, dict)
+                                    or edit.get("action") != "voidwright-opt-in"
+                                    or edit.get("previous_operation_id") != previous_operation_id
+                                    or not isinstance(operation, str) or len(operation) != 32
+                                    or any(character not in "0123456789abcdef" for character in operation)
+                                    or operation in seen_operation_ids
+                                    or not isinstance(edit.get("sector_sha256_before"), str)
+                                    or not isinstance(edit.get("sector_sha256_after"), str)):
+                                chain_valid = False
+                                break
+                            seen_operation_ids.add(operation)
+                            previous_operation_id = operation
+                    fixture_sector_sha256_at_activation = active.get("fixture_sector_sha256")
+                    fixture_sector_sha256_current = file_hash(instance / "World/SANDBOX_0_0_0_.sbs")
+                    fixture_sector_changed_by_engine = bool(
+                        fixture_sector_sha256_at_activation and fixture_sector_sha256_current
+                        and fixture_sector_sha256_at_activation != fixture_sector_sha256_current
+                    )
                     fixture_edits_valid = bool(
                         fixture_edit_ledger_sha256
                         and isinstance(ledger, dict)
@@ -207,7 +218,9 @@ def main() -> int:
                         and ledger.get("fixture_id") == lab.get("fixture_id")
                         and ledger.get("source_tree_sha256") == lab.get("source_tree_sha256")
                         and chain_valid and edits
-                        and edits[-1].get("sector_sha256_after") == current_sector_hash
+                        and active.get("fixture_edit_ledger_sha256") == fixture_edit_ledger_sha256
+                        and active.get("fixture_edit_count") == len(edits)
+                        and isinstance(fixture_sector_sha256_at_activation, str)
                     )
     lab_operation_events: list[str] = []
     lab_operation_status = None
@@ -274,6 +287,9 @@ def main() -> int:
         "fixture_edit_ledger_sha256": fixture_edit_ledger_sha256,
         "fixture_edit_count": fixture_edit_count,
         "fixture_edits_valid": fixture_edits_valid,
+        "fixture_sector_sha256_at_activation": fixture_sector_sha256_at_activation,
+        "fixture_sector_sha256_current": fixture_sector_sha256_current,
+        "fixture_sector_changed_by_engine": fixture_sector_changed_by_engine,
     }
     receipt["passed"] = bool(
         receipt["session_loaded"]

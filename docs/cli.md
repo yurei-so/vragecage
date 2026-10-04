@@ -114,8 +114,10 @@ When a destructive-lab run carries a command, the same receipt remains non-passi
 plugin evidence reaches the successful `complete` terminal state. Accepted, acquired, and running
 events prove progress only; timeout, controller loss/unavailability, and unsupported-controller are
 terminal failures. Server readiness and operation completion are deliberately separate facts.
-If an offline fixture edit ledger exists, receipts also require its identity, hash chain, and current
-sector hash to agree; an edited copy cannot pass after an unreceipted sector replacement.
+If an offline fixture edit ledger exists, run activation verifies its identity, operation chain, and
+the edited controller names against the stopped-world sector, then snapshots both ledger and sector
+hashes. Receipts bind that activation snapshot and report the current post-run sector hash separately,
+because VRAGE legitimately rewrites its own world files while saving.
 
 A staged package may declare an optional bounded `observation_prefix` in
 `vragecage.integration.json`. Matching log payloads are deduplicated and returned as at most 32

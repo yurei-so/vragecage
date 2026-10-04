@@ -197,7 +197,14 @@ def opt_in(path: Path, controller_id: int, label: str | None) -> dict[str, objec
     before = sha256(sector)
     custom_name = block.find("CustomName")
     if custom_name is None:
-        custom_name = ET.SubElement(block, "CustomName")
+        custom_name = ET.Element("CustomName")
+        children = list(block)
+        insert_at = next(
+            (index for index, child in enumerate(children)
+             if child.tag in {"ComponentContainer", "ShowOnHUD", "ShowInTerminal", "Enabled"}),
+            len(children),
+        )
+        block.insert(insert_at, custom_name)
     custom_name.text = new_name
     temporary = sector.with_name(sector.name + ".tmp")
     tree.write(temporary, encoding="utf-8", xml_declaration=True)
@@ -215,6 +222,7 @@ def opt_in(path: Path, controller_id: int, label: str | None) -> dict[str, objec
         "new_name": new_name,
         "sector_sha256_before": before,
         "sector_sha256_after": after,
+        "previous_operation_id": ledger["edits"][-1].get("operation_id") if ledger["edits"] else None,
     }
     ledger["edits"].append(edit)
     try:

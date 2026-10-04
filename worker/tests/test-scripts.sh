@@ -245,6 +245,20 @@ import json
 import sys
 assert json.loads(sys.argv[1])["status"] == "already_opted_in"
 PY
+command="$($repo_root/worker/lab-contract.py plan-drive \
+  "$worker_root/instances/imported" 12345 --distance 2 --max-speed 1 --timeout-ticks 600)"
+active="$($repo_root/worker/lab-contract.py activate "$worker_root/instances/imported")"
+run_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["run_id"])' "$active")"
+operation_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["command"]["operation_id"])' "$active")"
+python3 - "$active" <<'PY'
+import json
+import sys
+
+active = json.loads(sys.argv[1])
+assert len(active["fixture_edit_ledger_sha256"]) == 64
+assert len(active["fixture_sector_sha256"]) == 64
+assert active["fixture_edit_count"] == 1
+PY
 if VRAGECAGE_WORKER_ROOT="$worker_root" \
     "$repo_root/worker/import-world.py" invalid-lab "$worker_root/incoming/imported-world" \
       --engine proton --destructive-lab >/dev/null 2>&1; then
