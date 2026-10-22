@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import ipaddress
@@ -723,6 +723,52 @@ def _validate_local_vehicle_test_instrumentation(instance: Path, instance_name: 
         if (len(controller) != 1 or len(camera) != 1 or wheel_map != expected_wheels or len(gravity) != 1):
             raise SystemExit("Hydro Scout controller/camera/wheel map/gravity identity check failed")
         return configured_camera_id
+    if instance_name == "land-local-test-v4r1-blue-20261022-a":
+        if (source_tree_sha256 != "7377fa735e431f7108e57735ff79a3f33aee662ee208e670ee79800d1585fa8c" or
+                type(configured_camera_id) is not int or configured_camera_id != 91077977706459680):
+            raise SystemExit("Blue Truck camera binding is not tied to the exact reviewed clone")
+        sector_path = instance / "World" / "SANDBOX_0_0_0_.sbs"
+        try:
+            sector_root = ET.parse(sector_path).getroot()
+        except (OSError, ET.ParseError) as error:
+            raise SystemExit("Blue Truck sector is missing or invalid") from error
+        xsi_type = "{http://www.w3.org/2001/XMLSchema-instance}type"
+        grids = [entity for entity in sector_root.iter("MyObjectBuilder_EntityBase")
+                 if entity.get(xsi_type) == "MyObjectBuilder_CubeGrid"]
+        truck_matches = [entity for entity in grids
+                         if entity.findtext("EntityId") == "105034224363529183" and
+                         entity.findtext("DisplayName") == "Blue Truck"]
+        if len(truck_matches) != 1:
+            raise SystemExit("movement fixture does not contain the unique pinned Blue Truck")
+        truck = truck_matches[0]
+        blocks = list(truck.findall("./CubeBlocks/*"))
+        controller = [block for block in blocks if block.findtext("EntityId") == "83468039688685570" and
+                      block.get(xsi_type) == "MyObjectBuilder_Cockpit"]
+        camera = [block for block in blocks if block.findtext("EntityId") == str(configured_camera_id) and
+                  block.get(xsi_type) == "MyObjectBuilder_CameraBlock"]
+        all_blocks = {block.findtext("EntityId"): (grid, block)
+                      for grid in grids for block in grid.findall("./CubeBlocks/*")
+                      if block.findtext("EntityId")}
+        expected_wheels = {
+            "72448287472244394": "130825891980829223",
+            "102872810511526201": "127988954682183794",
+            "87663115116726466": "141480516845941196",
+            "95379321851010785": "95733545729686414",
+        }
+        wheel_map = {}
+        for block in blocks:
+            if block.get(xsi_type) != "MyObjectBuilder_MotorSuspension":
+                continue
+            top = all_blocks.get(block.findtext("TopBlockId"))
+            if top is not None:
+                wheel_map[block.findtext("EntityId")] = top[0].findtext("EntityId")
+            for field in ("PropulsionOverride", "SteeringOverride", "SteerAngle"):
+                raw = block.findtext(field)
+                if raw is not None and (not math.isfinite(float(raw)) or abs(float(raw)) > 1e-7):
+                    raise SystemExit("Blue Truck saved wheel overrides are not neutral")
+        if len(blocks) != 85 or len(controller) != 1 or len(camera) != 1 or wheel_map != expected_wheels:
+            raise SystemExit("Blue Truck controller/camera/wheel map differs from the pinned fixture")
+        return configured_camera_id
     ledger_path = instance / ".vragecage-diagnostic-instrumentation.json"
     sector_path = instance / "World" / "SANDBOX_0_0_0_.sbs"
     try:
@@ -833,7 +879,11 @@ def _validate_local_vehicle_direction_proof(instance_root: Path, proof: object,
             not re.fullmatch(r"[0-9a-f]{64}", current_plugin_tree_sha256):
         raise SystemExit("steering direction proof does not match the exact reviewed prior run")
     run_id = expected["prior_run_id"]
-    receipt_path = instance_root / "Quarantine" / run_id / "terminal-receipt.json"
+    # The reviewed calibration was captured on the preceding disposable clone.
+    # Keep its receipt and game log in that immutable source instance; do not
+    # copy or rewrite provenance into the current clone.
+    prior_instance = instance_root.parent / "local-vehicle-steering-v4-20261021-b"
+    receipt_path = prior_instance / "Quarantine" / run_id / "terminal-receipt.json"
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise SystemExit("prior steering terminal receipt is unavailable or unsafe")
     receipt_bytes = receipt_path.read_bytes()
@@ -855,7 +905,7 @@ def _validate_local_vehicle_direction_proof(instance_root: Path, proof: object,
             not isinstance(receipt.get("staged_plugin"), dict) or \
             receipt["staged_plugin"].get("tree_sha256") != expected["prior_plugin_tree_sha256"]:
         raise SystemExit("prior steering receipt does not bind the expected run, plugin, log, and clean stop")
-    log_path = instance_root / expected["prior_log_filename"]
+    log_path = prior_instance / expected["prior_log_filename"]
     if log_path.is_symlink() or not log_path.is_file() or \
             receipt.get("game_log") != str(log_path) or \
             hashlib.sha256(log_path.read_bytes()).hexdigest() != expected["prior_log_sha256"]:
@@ -1101,6 +1151,63 @@ def verify_block_lifecycle_prelaunch(instance: Path, active: dict[str, object]) 
             raise SystemExit("discovery-only lifecycle preflight found an actuator activation artifact")
 
 
+def _local_vehicle_world_storage(instance: Path) -> Path:
+    config_path = instance / "SpaceEngineers-Dedicated.cfg"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise SystemExit("local vehicle mailbox requires a regular server config")
+    try:
+        load_world = ET.parse(config_path).getroot().findtext("LoadWorld")
+        world = Path(load_world or "")
+        if not world.is_absolute():
+            world = instance / world
+        world = world.resolve(strict=True)
+        world.relative_to(instance.resolve(strict=True))
+    except (OSError, ET.ParseError, ValueError) as error:
+        raise SystemExit("local vehicle mailbox world path is invalid") from error
+    try:
+        session_name = ET.parse(world / "Sandbox.sbc").getroot().findtext("SessionName")
+    except (OSError, ET.ParseError) as error:
+        raise SystemExit("local vehicle mailbox could not resolve the saved session name") from error
+    if not session_name or Path(session_name).name != session_name:
+        raise SystemExit("local vehicle mailbox session name is invalid")
+    storage = instance / "Saves" / session_name / "Storage" / "VRage.Game"
+    storage.mkdir(parents=True, exist_ok=True)
+    if storage.is_symlink() or not storage.resolve(strict=True).is_relative_to(instance.resolve(strict=True)):
+        raise SystemExit("local vehicle mailbox storage escaped the selected instance")
+    return storage
+
+
+def _write_mailbox_file(path: Path, payload: bytes) -> None:
+    if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode)):
+        raise SystemExit("local vehicle mailbox target is not a regular file")
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_local_vehicle_test_authorization(instance: Path, active: dict[str, object],
+                                             local_test: dict[str, object]) -> str:
+    issued = datetime.now(timezone.utc)
+    expires = issued + timedelta(seconds=60)
+    epoch = datetime(1, 1, 1, tzinfo=issued.tzinfo)
+    ticks = lambda value: ((value - epoch).days * 86400 + (value - epoch).seconds) * 10_000_000 + (value - epoch).microseconds * 10
+    authorization_id = secrets.token_hex(16)
+    fields = ["VWLA2", str(instance.name), str(active["run_id"]), str(active["fixture_id"]),
+              authorization_id, str(local_test["grid_id"]), str(local_test["controller_id"]),
+              str(local_test["camera_id"]), str(ticks(expires))]
+    payload = ("|".join(fields) + "\n").encode("ascii")
+    path = _local_vehicle_world_storage(instance) / "voidwright-local-test-authorization-v1.txt"
+    _write_mailbox_file(path, payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
 def command_run(args: argparse.Namespace) -> int:
     root = worker_root()
     config = root / "instances" / args.instance / "SpaceEngineers-Dedicated.cfg"
@@ -1168,7 +1275,7 @@ def command_run(args: argparse.Namespace) -> int:
             },
             "land-local-test-v4r1-blue-20261022-a": {
                 "source_tree_sha256": "7377fa735e431f7108e57735ff79a3f33aee662ee208e670ee79800d1585fa8c",
-                "modes": {"read-only-baseline", "stationary-brake-only"},
+                "modes": {"read-only-baseline", "stationary-brake-only", "isolated-clear"},
                 "grid_id": 105034224363529183,
                 "controller_id": 83468039688685570,
                 "camera_id": 91077977706459680,
@@ -1193,8 +1300,8 @@ def command_run(args: argparse.Namespace) -> int:
                       "max_displacement_meters": 6.0, "command_timeout_seconds": 5,
                       "host_watchdog_seconds": 60}
         bounded = {**common, "mode": "isolated-clear", "propulsion_enabled": True,
-                   "isolated_clear": True, "max_speed_meters_per_second": 0.2,
-                   "max_displacement_meters": 6.0, "command_timeout_seconds": 5,
+                   "isolated_clear": True, "max_speed_meters_per_second": 0.50,
+                   "max_displacement_meters": 25.0, "command_timeout_seconds": 5,
                    "host_watchdog_seconds": 60}
         read_only = {**common, "mode": "read-only-baseline", "propulsion_enabled": False,
                      "isolated_clear": False, "max_speed_meters_per_second": 0.2,
@@ -1339,6 +1446,10 @@ def command_run(args: argparse.Namespace) -> int:
             "VRAGECAGE_LOCAL_VEHICLE_TEST_MAX_SPEED_METERS_PER_SECOND=" + str(local_test["max_speed_meters_per_second"]),
             "VRAGECAGE_LOCAL_VEHICLE_TEST_AUTH_TIMEOUT_SECONDS=60",
         ])
+        if bounded_mode and args.instance == "land-local-test-v4r1-blue-20261022-a":
+            env_args.append(
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_MOD_IDS="
+                "3795893318,2298956701,1090562767,3015328630,516770964")
         if local_test_camera_id is not None:
             env_args.extend([
                 f"VRAGECAGE_LOCAL_VEHICLE_TEST_CAMERA_ID={local_test_camera_id}",
@@ -1375,8 +1486,8 @@ def command_run(args: argparse.Namespace) -> int:
             raise SystemExit(activation.stderr.strip() or "lab authority activation failed")
         active = json.loads(activation.stdout)
         if args.instance in ("land-local-test-hydro-scout-20261022-c", "land-local-test-v4r1-blue-20261022-a"):
-            # Bind the narrow LocalVehicleTest authorization to the freshly minted
-            # discovery-only run before systemd starts. Movement always remains denied.
+            # Bind the LocalVehicleTest grant to the freshly minted discovery-only
+            # run before systemd starts; the exact config limits its scope.
             if (not discovery_only or active.get("bootstrap_mode") != "discovery-only"
                     or active.get("command") is not None
                     or active.get("instance") != args.instance
@@ -1388,21 +1499,30 @@ def command_run(args: argparse.Namespace) -> int:
                 local_test_config.is_file() and
                 json.loads(local_test_config.read_text(encoding="utf-8")).get("mode") == "stationary-brake-only"
             )
+            movement_authorization = (
+                args.instance == "land-local-test-v4r1-blue-20261022-a" and
+                local_test_config.is_file() and
+                json.loads(local_test_config.read_text(encoding="utf-8")).get("mode") == "isolated-clear"
+            )
+            local_test = json.loads(local_test_config.read_text(encoding="utf-8"))
             authorization = {
                 "schema": "vragecage.local-vehicle-test-authorization.v1",
                 "instance": args.instance,
                 "fixture_id": active["fixture_id"],
                 "run_id": active["run_id"],
                 "authorized_at": datetime.now().astimezone().isoformat(),
-                "scope": "stationary-brake-only" if brake_only_authorization else "read-only-baseline",
-                "actuator_commands": brake_only_authorization,
-                "movement_authorized": False,
+                "scope": ("stationary-brake-only" if brake_only_authorization else
+                          "bounded-forward-movement" if movement_authorization else "read-only-baseline"),
+                "actuator_commands": brake_only_authorization or movement_authorization,
+                "movement_authorized": movement_authorization,
                 "config_sha256": hashlib.sha256(q_config.read_bytes()).hexdigest(),
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "authorization_basis": (
-                    "explicit authorization for a propulsion-disabled stationary brake-only LocalVehicleTest preflight"
+                    "explicit authorization for a propulsion-disabled stationary brake-only LocalVehicleTest"
                     if brake_only_authorization else
-                    "explicit authorization for the read-only LocalVehicleTest baseline, relayed by Corvi"
+                    "explicit authorization for bounded forward movement on the exact disposable Blue Truck fixture"
+                    if movement_authorization else
+                    "explicit authorization for the read-only LocalVehicleTest baseline"
                 ),
             }
             authorization_path = Path(str(active["quarantine"])) / "authorization-receipt.json"
@@ -1415,6 +1535,10 @@ def command_run(args: argparse.Namespace) -> int:
                     os.fsync(stream.fileno())
             except OSError as error:
                 raise SystemExit(f"q run authorization receipt could not be recorded; refusing launch: {error}") from error
+            authorization["mailbox_sha256"] = _write_local_vehicle_test_authorization(
+                root / "instances" / args.instance, active, local_test)
+            authorization_bytes = (json.dumps(authorization, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            authorization_path.write_bytes(authorization_bytes)
         write_lab_bootstrap(root / "instances" / args.instance, active)
         if discovery_only:
             verify_block_lifecycle_prelaunch(root / "instances" / args.instance, active)
@@ -1724,6 +1848,79 @@ def command_lab_drive(args: argparse.Namespace) -> int:
     return run_checked(command)
 
 
+def command_local_vehicle_command(args: argparse.Namespace) -> int:
+    instance = instance_path(args.instance)
+    if args.instance != "land-local-test-v4r1-blue-20261022-a":
+        raise SystemExit("local vehicle commands are restricted to the pinned Blue Truck clone")
+    if not instance_is_active(args.instance):
+        raise SystemExit("local vehicle command requires the exact test server to be active")
+    try:
+        config = json.loads((instance / ".vragecage-local-vehicle-test.json").read_text(encoding="utf-8"))
+        active = json.loads((instance / ".vragecage-active-run.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit("local vehicle command lacks a valid run-bound fixture config") from error
+    if (config.get("mode") != "isolated-clear" or config.get("propulsion_enabled") is not True or
+            config.get("isolated_clear") is not True or active.get("instance") != args.instance or
+            not re.fullmatch(r"[0-9a-f]{32}", str(active.get("run_id", ""))) or
+            not re.fullmatch(r"[0-9a-f]{32}", str(active.get("fixture_id", "")))):
+        raise SystemExit("local vehicle command requires a fresh movement-enabled exact-instance run")
+    if args.kind == "drive":
+        if (not math.isfinite(args.value) or not 0 <= args.value <= 0.03 or
+                not math.isfinite(args.max_speed) or not 0 < args.max_speed <= config["max_speed_meters_per_second"] or
+                not math.isfinite(args.steering) or abs(args.steering) > 0.20):
+            raise SystemExit("drive command exceeds the 0.03 propulsion override, 0.20 steering override, or configured speed cap")
+        if abs(args.steering) > 0.001:
+            proof = config.get("steering_direction_proof")
+            plugin_hash = config.get("current_plugin_tree_sha256")
+            if proof is None or not isinstance(plugin_hash, str):
+                raise SystemExit("combined steering and propulsion requires the validated steering direction proof")
+            _validate_local_vehicle_direction_proof(instance, proof, plugin_hash)
+            logs = sorted(instance.glob("SpaceEngineersDedicated_*.log"),
+                          key=lambda path: path.stat().st_mtime, reverse=True)
+            if not logs or logs[0].is_symlink():
+                raise SystemExit("combined steering requires the current run's direction-proof activation log")
+            current_log = logs[0].read_text(encoding="utf-8", errors="replace")
+            if ("steeringDirectionProof=True" not in current_log or
+                    "run=" + str(active["run_id"]) not in current_log):
+                raise SystemExit("combined steering requires the current active run to have loaded the validated direction proof")
+        value, speed, steering = args.value, args.max_speed, args.steering
+    elif args.kind == "brake":
+        value, speed, steering = 1.0, 0.0, 0.0
+    else:
+        value, speed, steering = 0.0, 0.0, 0.0
+    if type(args.ttl_seconds) is not int or not 1 <= args.ttl_seconds <= 20:
+        raise SystemExit("local vehicle command lifetime must be 1-20 seconds")
+    issued = datetime.now(timezone.utc)
+    expires = issued + timedelta(seconds=args.ttl_seconds)
+    epoch = datetime(1, 1, 1, tzinfo=issued.tzinfo)
+    def ticks(value: datetime) -> int:
+        delta = value - epoch
+        return ((delta.days * 86400 + delta.seconds) * 10_000_000 + delta.microseconds * 10)
+    command_id = secrets.token_hex(16)
+    fields = ["VWLC2", command_id, args.instance, str(active["run_id"]), str(active["fixture_id"]),
+              str(config["grid_id"]), str(config["controller_id"]), args.kind,
+              format(value, ".17g"), format(speed, ".17g"), format(steering, ".17g"),
+              str(ticks(issued)), str(ticks(expires))]
+    payload = ("|".join(fields) + "\n").encode("ascii")
+    storage = _local_vehicle_world_storage(instance)
+    command_path = storage / "voidwright-local-test-command-v1.txt"
+    if command_path.is_file() and not command_path.is_symlink():
+        try:
+            existing = command_path.read_text(encoding="ascii")
+        except OSError:
+            existing = ""
+        if existing.endswith("\n") and existing.split("|")[-1].strip().isdigit():
+            if int(existing.split("|")[-1].strip()) > ticks(issued):
+                raise SystemExit("an unexpired local vehicle command already occupies the mailbox")
+    _write_mailbox_file(command_path, payload)
+    emit({"schema": "vragecage.local-vehicle-command.v1", "instance": args.instance,
+          "run_id": active["run_id"], "fixture_id": active["fixture_id"],
+          "command_id": command_id, "kind": args.kind, "value": value,
+          "max_speed_meters_per_second": speed, "expires_utc": expires.isoformat(),
+          "mailbox_sha256": hashlib.sha256(payload).hexdigest()})
+    return 0
+
+
 def command_lab_direct_maneuver(args: argparse.Namespace) -> int:
     if instance_is_active(args.instance):
         raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
@@ -1938,6 +2135,7 @@ def worker_main(args: argparse.Namespace) -> int:
         "register-passive-telemetry-plugin": command_register_passive_telemetry_plugin,
         "import-world": command_import_world,
         "lab-drive": command_lab_drive,
+        "local-vehicle-command": command_local_vehicle_command,
         "lab-direct-maneuver": command_lab_direct_maneuver,
         "lab-preflight-only": command_lab_preflight_only,
         "lab-command-activate": command_lab_command_activate,
@@ -2079,6 +2277,9 @@ def client_main(args: argparse.Namespace) -> int:
         ])
         if args.reverse:
             forwarded.append("--reverse")
+    if args.command == "local-vehicle-command":
+        forwarded.extend([args.kind, "--value", str(args.value), "--max-speed", str(args.max_speed),
+                          "--steering", str(args.steering), "--ttl-seconds", str(args.ttl_seconds)])
     if args.command == "lab-direct-maneuver":
         forwarded.extend([str(args.controller_id), str(args.grid_id), str(args.camera_id)])
         for segment in args.segment:
@@ -2236,6 +2437,15 @@ def parser() -> argparse.ArgumentParser:
     drive.add_argument("--timeout-ticks", type=int, default=600)
     drive.add_argument("--reverse", action="store_true",
                        help="back up at no more than 0.5 m/s for at most 3 meters")
+    local_command = subparsers.add_parser(
+        "local-vehicle-command", help="queue one short run-bound command on the exact disposable Blue Truck")
+    local_command.add_argument("instance", type=validate_instance)
+    local_command.add_argument("kind", choices=("drive", "brake", "neutral"))
+    local_command.add_argument("--value", type=float, default=0.03,
+                                help="forward propulsion override, capped at 0.03")
+    local_command.add_argument("--max-speed", type=float, default=0.1)
+    local_command.add_argument("--steering", type=float, default=0.0)
+    local_command.add_argument("--ttl-seconds", type=int, default=10)
     maneuver = subparsers.add_parser(
         "lab-direct-maneuver", help="queue a composed, bounded planner-independent Voidwright maneuver"
     )
