@@ -19,6 +19,7 @@ configuration and keeps the worker address explicit.
 | Command | Purpose | Mutates worker state |
 | --- | --- | --- |
 | `doctor [--engine ENGINE]` | Check the selected backend's prerequisites | No |
+| `instances` | Inventory prepared instances and loaded VRageCage services, bound to their world saves | No |
 | `prepare NAME [--engine ENGINE]` | Copy the Empty World, render its config, and record the backend | Yes |
 | `run NAME` | Start a prepared instance as a transient user service | Yes |
 | `wait NAME [observation gates]` | Wait for readiness and optional bounded observation evidence | No |
@@ -42,6 +43,14 @@ configuration and keeps the worker address explicit.
 | `lab-trial NAME [exact binding fields]` | Preview a fixed low-speed GPS trial and input digest; queue/start nothing | No command/world writes; lock metadata only |
 | `lab-trial NAME [same fields] --execute --expect-plan-sha256 HASH` | Run the reviewed request once; stop only with fresh zero-human evidence, otherwise leave it running for operator review | Yes |
 | `lab-trial-status NAME --fixture-id ID --request-id ID` | Read that fixture's durable request journal without replay | No |
+
+`instances` reports prepared instance directories, loaded `vragecage-<instance>.service` units, and
+dedicated-server processes whose `-path` binds them to an instance. A loaded service or process whose
+directory is missing remains visible as an orphan instead of disappearing from the inventory. Each prepared instance is bound to its
+configured `LoadWorld`, the session name in that world's `Sandbox.sbc`, and the expected
+`Saves/<session>` directory. Save snapshots report top-level file count, byte count, and latest
+write time without recursively scanning or hashing large worlds. `status NAME` includes the same
+world/save binding with the detailed unit state and receipt.
 
 ## Higher-level lab trial
 

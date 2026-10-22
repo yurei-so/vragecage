@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage a bounded multi-pose, grid-only HoloView proof in a stopped disposable instance.
+"""Stage a bounded spectator view or multi-pose grid-only HoloView proof in a stopped disposable instance.
 
 This does not alter the source mod, checkpoint, or live service. The staged mod still
 needs to be selected by a disposable-world test harness before it can compile/run.
@@ -78,6 +78,7 @@ def build_template(config: dict) -> str:
         "@@WIDTH@@": str(config["width"]),
         "@@HEIGHT@@": str(config["height"]),
         "@@RANGE@@": format(config["range_m"], ".17g") + "d",
+        "@@ALLOW_TERRAIN_OMISSION@@": "true" if config.get("allow_terrain_omission", False) else "false",
         "@@ORIGINS@@": ", ".join(cs_vector(p["origin"]) for p in config["poses"]),
         "@@FORWARDS@@": ", ".join(cs_vector(p["forward"]) for p in config["poses"]),
         "@@UPS@@": ", ".join(cs_vector(p["up"]) for p in config["poses"]),
@@ -91,8 +92,10 @@ def build_template(config: dict) -> str:
 def patch_sources(session: str, worker: str) -> tuple[str, str]:
     session = replace_once(
         session,
-        "            ticks++;\n            if (ticks == 1) PersistentWorldCacheLoadManifest();",
-        "            ticks++;\n            VrageCageTickVirtualCapture();\n            if (ticks == 1) PersistentWorldCacheLoadManifest();",
+        "            if (MyAPIGateway.Utilities != null && MyAPIGateway.Utilities.IsDedicated)\n                return;\n            ticks++;\n",
+        "            if (MyAPIGateway.Utilities != null && MyAPIGateway.Utilities.IsDedicated)\n"
+        "            {\n                ticks++;\n                VrageCageTickVirtualCapture();\n                ConsumeCompletedWorkerFrames();\n                return;\n            }\n"
+        "            ticks++;\n            VrageCageTickVirtualCapture();\n",
         "virtual update hook",
     )
     session = replace_once(
@@ -120,13 +123,18 @@ def patch_sources(session: str, worker: str) -> tuple[str, str]:
         "        {\n            BuildStableRasterBlockList(cam, sourceProxies);",
         "virtual scene preparation overload",
     )
-    worker = replace_once(worker, "            public long CameraEntityId;\n", "            public long CameraEntityId;\n            public int VirtualIndex = -1;\n", "virtual job identity")
-    worker = replace_once(
-        worker,
-        "            job.OutputId = output.EntityId;\n            job.CameraEntityId = camera.EntityId;",
-        "            job.OutputId = output.EntityId;\n            job.CameraEntityId = camera.EntityId;\n            job.VirtualIndex = -1;",
-        "physical job preservation",
-    )
+    if "public int VirtualIndex = -1;" not in worker:
+        worker = replace_once(
+            worker, "            public long OutputId;\n",
+            "            public long OutputId;\n            public int VirtualIndex = -1;\n",
+            "virtual job identity",
+        )
+    if "            job.OutputId = output.EntityId;\n            job.VirtualIndex = -1;" not in worker:
+        worker = replace_once(
+            worker, "            job.OutputId = output.EntityId;\n",
+            "            job.OutputId = output.EntityId;\n            job.VirtualIndex = -1;\n",
+            "physical job preservation",
+        )
     worker = replace_once(
         worker,
         "            if (job == null)\n                return;\n\n            LcdSurfaceKey completedKey",
@@ -140,7 +148,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("instance", type=Path)
     parser.add_argument("source_mod", type=Path)
-    parser.add_argument("config", type=Path, help="JSON two-to-four-pose lab request")
+    parser.add_argument("config", type=Path, help="JSON one-to-four-pose spectator view request")
     parser.add_argument("--stage-name", required=True)
     args = parser.parse_args()
     instance = args.instance.resolve(strict=True)
@@ -157,8 +165,11 @@ def main() -> None:
         raise SystemExit(f"refusing to stage while {unit} is running")
     stage_name = identifier(args.stage_name, "stage_name")
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    if set(config) != {"world_name", "request_id", "capture_id", "width", "height", "range_m", "poses"}:
+    required = {"world_name", "request_id", "capture_id", "width", "height", "range_m", "poses"}
+    if set(config) not in (required, required | {"allow_terrain_omission"}):
         raise SystemExit("request has missing or unsupported fields")
+    if "allow_terrain_omission" in config and type(config["allow_terrain_omission"]) is not bool:
+        raise SystemExit("allow_terrain_omission must be a boolean")
     for field in ("world_name", "request_id", "capture_id"):
         config[field] = identifier(config[field], field)
     world_name = ElementTree.parse(instance / "World/Sandbox.sbc").getroot().findtext("SessionName")
@@ -168,8 +179,8 @@ def main() -> None:
         raise SystemExit("first proof supports exactly 256x256 pixels")
     if isinstance(config["range_m"], bool) or not isinstance(config["range_m"], (int, float)) or not 10 <= config["range_m"] <= 512:
         raise SystemExit("range_m must be within 10..512")
-    if not isinstance(config["poses"], list) or not 2 <= len(config["poses"]) <= 4:
-        raise SystemExit("virtual proof requires two to four poses")
+    if not isinstance(config["poses"], list) or not 1 <= len(config["poses"]) <= 4:
+        raise SystemExit("virtual view requires one to four poses")
     config["poses"] = [normalize_pose(p) for p in config["poses"]]
     if any(path.is_symlink() for path in source.rglob("*")):
         raise SystemExit("source mod contains a symlink")

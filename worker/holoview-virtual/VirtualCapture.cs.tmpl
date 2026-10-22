@@ -20,6 +20,7 @@ namespace HoloCamRestored2D
         const int VrageCageVirtualWidth = @@WIDTH@@;
         const int VrageCageVirtualHeight = @@HEIGHT@@;
         const double VrageCageVirtualRange = @@RANGE@@;
+        const bool VrageCageVirtualAllowTerrainOmission = @@ALLOW_TERRAIN_OMISSION@@;
         readonly Vector3D[] vrageCageVirtualOrigins = new Vector3D[] { @@ORIGINS@@ };
         readonly Vector3D[] vrageCageVirtualForwards = new Vector3D[] { @@FORWARDS@@ };
         readonly Vector3D[] vrageCageVirtualUps = new Vector3D[] { @@UPS@@ };
@@ -31,9 +32,14 @@ namespace HoloCamRestored2D
 
         void VrageCageTickVirtualCapture()
         {
-            if (vrageCageVirtualStopped || vrageCageVirtualInFlight || ticks < 60 || ticks > 600 ||
+            if (ticks == 1)
+                MyLog.Default.WriteLineAndConsole("[VRageCage] virtual HoloView update hook active; dedicated=" +
+                    (MyAPIGateway.Utilities != null && MyAPIGateway.Utilities.IsDedicated));
+            if (vrageCageVirtualStopped || vrageCageVirtualInFlight || ticks < 1 || ticks > 600 ||
                 vrageCageVirtualNextPose >= vrageCageVirtualOrigins.Length)
                 return;
+            if (ticks == 1)
+                MyLog.Default.WriteLineAndConsole("[VRageCage] virtual HoloView spectator capture requested");
 
             string actualWorld = MyAPIGateway.Session != null ? MyAPIGateway.Session.Name : null;
             if (!string.Equals(actualWorld, VrageCageVirtualExpectedWorld, StringComparison.Ordinal))
@@ -42,15 +48,17 @@ namespace HoloCamRestored2D
                 return;
             }
 
-            // The first bounded primitive supports space-platform fixtures only. A planet would
-            // require a view-local terrain lattice; returning grids with missing terrain is unsafe.
+            // Terrain is omitted in this grid-only capture mode. Planet-world captures therefore
+            // require an explicit request opt-in and record terrain_included=false in the receipt.
             var entities = new HashSet<IMyEntity>();
             MyAPIGateway.Entities.GetEntities(entities, delegate(IMyEntity e)
             {
                 return e is Sandbox.Game.Entities.MyPlanet || e is IMyCubeGrid;
             });
+            bool hasPlanet = false;
             foreach (IMyEntity entity in entities)
-                if (entity is Sandbox.Game.Entities.MyPlanet)
+                if (entity is Sandbox.Game.Entities.MyPlanet) hasPlanet = true;
+            if (hasPlanet && !VrageCageVirtualAllowTerrainOmission)
                 {
                     VrageCageVirtualReject("planet-terrain-unsupported", actualWorld);
                     return;
@@ -111,7 +119,6 @@ namespace HoloCamRestored2D
                 WorkerRasterJob job = slot.Job;
                 job.VirtualIndex = index;
                 job.OutputId = 0;
-                job.CameraEntityId = 0;
                 job.SurfaceIndex = -1;
                 job.Cam = cam;
                 job.FovDegrees = vrageCageVirtualFovs[index];
@@ -211,6 +218,7 @@ namespace HoloCamRestored2D
             receipt.Append("\",\"world_name_observed\":\"");
             receipt.Append(MyAPIGateway.Session.Name);
             receipt.Append("\",\"pose_index\":").Append(index.ToString(CultureInfo.InvariantCulture));
+            receipt.Append(",\"terrain_included\":false");
             receipt.Append(",\"snapshot_tick\":").Append(job.SnapshotTick.ToString(CultureInfo.InvariantCulture));
             receipt.Append(",\"width\":").Append(job.Width.ToString(CultureInfo.InvariantCulture));
             receipt.Append(",\"height\":").Append(job.Height.ToString(CultureInfo.InvariantCulture));

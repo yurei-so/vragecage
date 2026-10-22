@@ -1,6 +1,6 @@
 # Virtual-camera HoloView proof
 
-Status: **verified, bounded grid-only proof in a disposable Space Engineers world**. This is not yet a general render service or Voidwright MCP `capture_view()` tool. Planet terrain is explicitly rejected. The prototype accepts exactly two 256×256 world-space poses, runs one read-only HoloView worker job per pose, and exports RGBA plus pose/tick metadata without a physical camera or LCD pair for either job. The physical-camera/LCD path is retained.
+Status: **verified, bounded grid-only HoloView rendering in disposable Space Engineers worlds**. VRageCage can stage one to four explicit 256×256 world-space poses, run one read-only HoloView worker job per pose, and export RGBA plus pose/tick metadata without a physical camera or LCD pair. A single pose is a spectator view: choose any world-space origin and camera orientation, then render nearby saved-grid geometry from that viewpoint. A separate on-demand bridge exposes `capture_view` through Voidwright, but VRageCage's static pose request does not depend on Voidwright or its perspective IDs. Neither path needs an LCD entity or retained LCD-output buffer. Both use HoloView's software rasterizer, not a native game screenshot. Planet terrain is rejected by default; an explicit grid-only option permits planet-world captures and records that terrain is absent.
 
 ## Build and runtime dependencies
 
@@ -10,11 +10,50 @@ The game runtime is the meaningful build check. An initial compile rejected `Sys
 
 ## Extraction implemented
 
-`worker/instrument-holoview-virtual.py` validates a stopped imported destructive-lab copy and strict two-pose request, then stages a unique local mod copy. It adds a virtual job branch to `PortalLcdSession.UpdateAfterSimulation`, overloads stable raster candidate selection to accept a separate dictionary of source-grid proxies, and routes completed virtual jobs to an exporter before LCD presentation. Physical jobs retain their original proxies, camera resolution, scheduling, and text-surface presentation path.
+`worker/instrument-holoview-virtual.py` validates a stopped imported destructive-lab copy and a strict one-to-four-pose request, then stages a unique local mod copy. Supply one pose for a spectator view or several poses for a bounded viewpoint comparison. It adds a virtual job branch to `PortalLcdSession.UpdateAfterSimulation`, overloads stable raster candidate selection to accept a separate dictionary of source-grid proxies, and routes completed virtual jobs to an exporter before LCD presentation. Physical jobs retain their original proxies, camera resolution, scheduling, and text-surface presentation path.
 
-For a virtual job, grids are acquired directly from `MyAPIGateway.Entities`, bounded to 64 nearby grids within the requested range, then cached and frustum-filtered against the requested matrix. That scene is snapshotted into `WorkerRasterJob`; its `Cam` and FOV drive HoloView's existing software rasterizer. No camera or LCD entity ID is supplied. Shared main-thread frustum settings are restored after each snapshot. A planet causes rejection because this proof does not build a view-local terrain lattice.
+Example one-view request (`poses` is the only view-specific input):
+
+```json
+{
+  "world_name": "test_suite_world_v2_r3",
+  "request_id": "spectator_request_001",
+  "capture_id": "spectator_view_001",
+  "width": 256,
+  "height": 256,
+  "range_m": 200,
+  "allow_terrain_omission": true,
+  "poses": [
+    {
+      "origin": [12.2, 108.7, 22.1],
+      "forward": [0, 0, -1],
+      "up": [0, 1, 0],
+      "fov_degrees": 60
+    }
+  ]
+}
+```
+
+The origin and basis are in Space Engineers world coordinates. `forward` and `up` must be unit and perpendicular; choose them to aim the virtual viewpoint. `allow_terrain_omission` is optional and defaults to false. Set it true only when grid-only imagery is useful in a planet world; the frame receipt explicitly says `terrain_included: false`. Stage it with `worker/instrument-holoview-virtual.py INSTANCE SOURCE_MOD REQUEST.json --stage-name STAGE_NAME`, then use the existing guarded disposable-world registration and run workflow. The staged run exports `vragecage-virtual-CAPTURE_ID-0.rgba64.txt` and a JSON pose/tick receipt to the HoloView world storage. This is currently a bounded staged capture, not a live interactive camera feed or native screenshot.
+
+For a virtual job, grids are acquired directly from `MyAPIGateway.Entities`, bounded to 64 nearby grids within the requested range, then cached and frustum-filtered against the requested matrix. That scene is snapshotted into `WorkerRasterJob`; its `Cam` and FOV drive HoloView's existing software rasterizer. No camera or LCD entity ID is supplied. Shared main-thread frustum settings are restored after each snapshot. A planet is rejected by default because this proof does not build a view-local terrain lattice. The explicit terrain-omission option allows grid rendering in a planet world but does not show ground or terrain; frame metadata records this omission.
 
 The request fields are `origin`/`forward`/`up` in Space Engineers world coordinates (meters; orthonormal camera basis), horizontal `fov_degrees`, world session name, request/capture IDs, range, and 256×256 dimensions. Non-finite or non-unit vectors, non-perpendicular axes, out-of-range FOV/origin/range, unexpected fields, and mismatched world name are rejected. This is a lab instrumenter, not a network listener.
+
+## On-demand image path
+
+For an existing enrolled grid and process-local perspective, use Voidwright MCP `capture_view`.
+The adapter writes a bounded request to the configured HoloView world-storage mailbox, HoloView
+renders the requested virtual pose, and the adapter returns a PNG with run/snapshot/render provenance.
+The path needs no physical camera block, LCD entity, or LCD output buffer. It is a one-request-at-a-time
+software render, not a continuous video feed; it renders bounded saved-grid geometry and rejects
+planet terrain. The adapter and runtime setup are documented in
+[`voidwright-live-capture-2026-10-13.md`](voidwright-live-capture-2026-10-13.md).
+
+The periodic physical-camera capture described in `render-trials.md` is a separate path: it samples
+HoloView's completed retained LCD RGBA output for a specific camera/output pair. Use that when the
+LCD composition itself is the subject. Use virtual `capture_view` for viewpoint imagery without an
+LCD target.
 
 ## Two-pose test receipt
 
@@ -31,7 +70,21 @@ The images differ at 41,932 pixels. Visual inspection shows the platform feature
 
 To reproduce on a **new** stopped disposable world copy: stage HoloView source with `worker/instrument-holoview-virtual.py`, register that staged mod, replace only the copied world's published HoloView entry with `worker/replace-published-mod.py`, run and stop the isolated Magnetar instance, then invoke `worker/verify-holoview-virtual.py FRAME_STORAGE REQUEST_JSON TERMINAL_RECEIPT`. Never point the instrumenter at a production world or Workshop cache.
 
+## Follow-up: terrain rendering
+
+The V4 test used the explicit grid-only planet option. Add terrain support as a separate follow-up: extract a bounded view-local terrain surface, feed it into the software rasterizer with suitable detail/occlusion handling, then verify terrain-inclusive captures in a disposable planet fixture. Keep terrain omission explicit until that path is implemented and verified.
+
 ## Remaining limits
 
-This establishes arbitrary-angle **grid** rendering in the tested space fixture, not all possible world geometry or a public API. The job is a one-shot, two-pose configuration embedded into a staged local mod; it does not accept live MCP requests. It rejects planet worlds rather than render missing terrain. Dynamic entities and environmental effects are not yet independently selected for the virtual scene. Ticks 61 and 71 are not simultaneous. Generalization should extract a typed `RenderView` shared by grid, terrain, dynamic-entity selection, and rasterization before exposing `capture_view()`.
-The tested world still contained physical cameras/LCDs for the pre-existing path, which also continued rendering. The virtual branch itself neither resolves nor supplies those IDs, but a separate camera-free fixture test has not yet been run.
+This establishes arbitrary-angle **grid** rendering, not all possible world geometry or a general scene API. VRageCage's current request is one to four static poses embedded into a staged local mod; it does not accept live interactive viewpoint changes. Planet captures require the explicit `allow_terrain_omission` opt-in and render no ground or terrain. Dynamic entities and environmental effects are not yet independently selected for the virtual scene. Multi-pose frames are rendered at separate updates, not simultaneously. A future live spectator service could reuse a typed `RenderView` for grid, terrain, dynamic-entity selection, and rasterization.
+The virtual branch neither resolves nor supplies physical camera/LCD IDs; captures are exported directly from the software rasterizer.
+
+## V4 truck front-marker test
+
+The camera-free software spectator path was exercised against the disposable V4 fixture `test-suite-world-v4-obstacle-baseline-20261018-e`, targeting Blue Truck grid `105034224363529183`. Request fixture: `worker/tests/fixtures/virtual-v4-blue-truck-spectator.json`. The camera pose was above the truck. The initial annotation direction was reversed; the preview below corrects the arrow to point toward the truck's front. The planet's terrain was intentionally omitted and the frame receipt records `terrain_included: false`.
+
+The verified frame contains 445 geometry primitives and 65,399 visible pixels at 256×256. Its raw RGBA SHA-256 is `403fa6c6a395ef8a13fa9c2ee562a9ee500d39c99c73f5d6e76a95f8c1e73b0a`. Run `50593dd206795956859f2cb394fa5437` completed and the server stopped cleanly. The rendered view and pose/verification receipts are in `artifacts/spectator-view-v4-blue-truck-20261022/`.
+
+The white arrow and `FRONT` label in the preview below are a corrected, post-capture overlay. They are a visualization aid, not an in-game marker, object, or measurement emitted by HoloView. The unannotated software-rendered frame is kept alongside the PNG overlay in `docs/assets/`.
+
+![V4 software spectator view above the Blue Truck with a corrected white front-direction marker](assets/blue-truck-spectator-front.png)

@@ -1,0 +1,9 @@
+{
+  "derived_from": "blue-truck-spectator-raw.png",
+  "target_grid_entity_id": "105034224363529183",
+  "capture_id": "blue_truck_front_v4_20261022_a",
+  "annotation": "Post-capture arrow overlay points toward the truck front; the initial arrow direction was reversed.",
+  "game_state_modified": false,
+  "physical_marker_created": false,
+  "terrain_included": false
+}

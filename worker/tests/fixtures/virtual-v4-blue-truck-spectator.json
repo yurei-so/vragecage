@@ -1,0 +1,17 @@
+{
+  "world_name": "test_suite_world_v4",
+  "request_id": "spectator_front_v4_20261022_a",
+  "capture_id": "blue_truck_front_v4_20261022_a",
+  "width": 256,
+  "height": 256,
+  "range_m": 35,
+  "allow_terrain_omission": true,
+  "poses": [
+    {
+      "origin": [7658.976156536743, 8742.193487495289, -16191.585571127723],
+      "forward": [-0.37183028, -0.0060667284, 0.9282807],
+      "up": [-0.0008365363, 0.9999802, 0.0061998367],
+      "fov_degrees": 50
+    }
+  ]
+}

@@ -81,6 +81,7 @@ class VirtualReceiptTests(unittest.TestCase):
             (self.folder / f"{stem}.rgba64.txt").write_bytes(base64.b64encode(image))
             metadata = {
                 "schema": "vragecage.virtual-holoview.v1", "source_kind": "virtual",
+                "terrain_included": False,
                 "request_id": "req", "world_name_observed": "world", "pose_index": index,
                 "snapshot_tick": 60 + index, "width": 16, "height": 16,
                 "fov_degrees": 60, "geometry_primitives": 20,

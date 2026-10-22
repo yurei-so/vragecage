@@ -10,9 +10,11 @@ native framebuffer access.
 These are explicitly **HoloView software renders**, not native Space Engineers screenshots and not
 simulator ground truth. Earlier V2R3 captures demonstrated the RGBA buffer and pose metadata; periodic
 capture extends that same path by sampling a selected camera/LCD output every N simulation ticks.
-A bounded, LCD-free **grid-only** virtual-pose proof is now verified in a disposable space fixture;
-it is not yet a general render service or planet-terrain capture. See
-[virtual-camera-render.md](virtual-camera-render.md) for the implementation, two-pose receipt, and limits.
+A bounded, LCD-free **grid-only** virtual-pose path is implemented: the worker can stage a VRageCage
+spectator view from one operator-supplied world position and orientation, or a one-to-four-pose
+comparison. The separate Voidwright adapter can request a one-shot `capture_view`. Neither is a
+continuous stream, general scene renderer, or planet-terrain capture. See
+[virtual-camera-render.md](virtual-camera-render.md) for the on-demand path, proof receipt, and limits.
 Every exported frame is separately hashed and correlated with its simulation tick and camera pose.
 The run is bounded by frame count, byte count, raster dimensions, and simulation duration.
 

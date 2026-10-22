@@ -33,6 +33,8 @@ plan, [the CLI contract](docs/cli.md) for commands and exit semantics, and
 [the worker guide](worker/README.md) for the real-engine smoke contract.
 For the offline spatial replay and evidence bundle, see [the replay guide](docs/spatial-replay.md)
 and the [Blue Truck startup-anomaly replay](artifacts/black-box-blue-truck-2026-10-21/index.html).
+For HoloView imagery without an LCD target, see the [virtual camera renderer](docs/virtual-camera-render.md)
+and the [on-demand Voidwright capture receipt](docs/voidwright-live-capture-2026-10-13.md).
 
 The local higher-level tooling extension adds `lab-trial` for previewed,
 hash-bound, journaled GPS trials and `lab-trial-status` for recovery without
@@ -58,6 +60,9 @@ Select a provisioned worker with `--host`, `VRAGECAGE_HOST`, or
 # Disposable full lifecycle, ending in a hashed JSON receipt.
 vragecage smoke my-test-run
 
+# Inventory every prepared instance, its live service state, and its configured/saved world.
+vragecage instances
+
 # Persistent lifecycle for a prepared fixture.
 vragecage prepare my-run --engine-ready
 vragecage stage-mod my-run /path/to/ModPackage --name MyMod
@@ -67,6 +72,14 @@ vragecage status my-run
 vragecage stop my-run
 vragecage receipt my-run
 ```
+
+`instances` is a read-only worker inventory. It reports every prepared instance, every loaded
+`vragecage-<instance>.service`, and dedicated-server processes whose `-path` binds them to an
+instance, including orphaned processes or services whose instance directory is missing.
+For each instance it resolves the configured `LoadWorld`, reads that world's session name, and
+reports both the loaded world path and `Saves/<session>` path with top-level file count, bytes, and
+latest write time. It does not walk large save trees or read/hash save contents. `status <instance>`
+includes the same save binding alongside the detailed systemd state and latest receipt.
 
 For unpublished integration tests, select Magnetar when the fixture is created. Later commands
 discover the recorded engine automatically:

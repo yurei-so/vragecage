@@ -47,8 +47,8 @@ def verify(folder: Path, request: dict, terminal: dict, terminal_sha256: str) ->
     log_bytes = game_log.read_bytes()
     require(hashlib.sha256(log_bytes).hexdigest() == server.get("game_log_sha256"), "game log hash mismatch")
     log_text = log_bytes.decode("utf-8", errors="replace")
-    require(isinstance(request.get("poses"), list) and 2 <= len(request["poses"]) <= 4,
-            "two to four poses required")
+    require(isinstance(request.get("poses"), list) and 1 <= len(request["poses"]) <= 4,
+            "one to four poses required")
     frames = []
     pixels = []
     for index, pose in enumerate(request["poses"]):
@@ -56,6 +56,7 @@ def verify(folder: Path, request: dict, terminal: dict, terminal_sha256: str) ->
         metadata = json.loads((folder / f"{stem}.json").read_text(encoding="utf-8"))
         require(metadata.get("schema") == "vragecage.virtual-holoview.v1", "unexpected frame schema")
         require(metadata.get("source_kind") == "virtual", "frame is not a virtual job")
+        require(metadata.get("terrain_included") is False, "terrain provenance is missing or inconsistent")
         require(metadata.get("request_id") == request["request_id"], "request ID mismatch")
         require(metadata.get("world_name_observed") == request["world_name"], "world identity mismatch")
         require(metadata.get("pose_index") == index, "pose index mismatch")
