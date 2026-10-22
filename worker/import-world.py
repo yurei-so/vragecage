@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from local_vehicle_test_packages import INSTANCE, SOURCE_TREE_SHA256, published_mod_receipts
 
 
 def tree_receipt(root: Path) -> tuple[int, int, str]:
@@ -54,6 +55,16 @@ def main() -> int:
             raise SystemExit(f"world is missing required file: {required}")
 
     files, size, sha256 = tree_receipt(source)
+    mod_packages = None
+    worker_root_path = Path(os.environ.get(
+        "VRAGECAGE_WORKER_ROOT", "~/.local/share/vragecage-worker")).expanduser()
+    if args.instance == INSTANCE:
+        if sha256 != SOURCE_TREE_SHA256:
+            raise SystemExit("q source world does not match the pinned fixture hash")
+        try:
+            mod_packages = published_mod_receipts(source, worker_root_path)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"q published mod cache failed the reviewed hash allowlist: {error}") from error
     env = os.environ.copy()
     env["VRAGECAGE_SOURCE_WORLD"] = str(source)
     script_dir = Path(__file__).resolve().parent
@@ -71,6 +82,8 @@ def main() -> int:
         "byte_count": size,
         "tree_sha256": sha256,
     }
+    if mod_packages is not None:
+        receipt["published_mod_packages"] = mod_packages
     receipt_path = instance / ".vragecage-world-import.json"
     temporary = receipt_path.with_suffix(".tmp")
     temporary.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")

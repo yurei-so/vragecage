@@ -30,7 +30,7 @@ public sealed class SimulationRunner
         {
             var distance = Distance(state.X, state.Z,
                 scenario.Goal.Position.X, scenario.Goal.Position.Z);
-            if (distance <= scenario.Goal.Tolerance)
+            if (distance <= scenario.Goal.Tolerance && Math.Abs(state.Speed) <= 0.05)
                 return Finish(scenario, frames, state, distance, RunOutcome.ReachedGoal, tick);
             if (Collides(scenario, state))
                 return Finish(scenario, frames, state, distance, RunOutcome.Collision, tick);

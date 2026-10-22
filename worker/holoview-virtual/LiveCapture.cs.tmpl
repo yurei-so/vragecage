@@ -1,0 +1,432 @@
+using Sandbox.ModAPI;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using VRage.Game.ModAPI;
+using VRage.ModAPI;
+using VRage.Utils;
+using VRageMath;
+
+namespace HoloCamRestored2D
+{
+    // Bounded request/response bridge for one on-demand grid-only virtual frame.
+    // The only game-side operation is HoloView's existing software rasterizer.
+    public sealed partial class PortalLcdSession
+    {
+        const string VrageCageLiveRequestFile = "voidwright-live-capture-request-v1.txt";
+        const int VrageCageLiveMaximumRequestAgeSeconds = 30;
+        const int VrageCageLiveWidth = 256;
+        const int VrageCageLiveHeight = 256;
+        readonly Dictionary<long, GridProxy> vrageCageLiveVirtualProxies = new Dictionary<long, GridProxy>();
+        readonly string vrageCageLiveRendererSessionId = Guid.NewGuid().ToString("N");
+        string vrageCageLiveCurrentRequestId;
+        string vrageCageLiveLastRequestId;
+        bool vrageCageLiveInFlight;
+
+        sealed class VrageCageLiveRequest
+        {
+            public string RequestId;
+            public string PerspectiveId;
+            public string WorldScopeId;
+            public string RunId;
+            public string WorldName;
+            public string SnapshotCapturedAtUtc;
+            public long TargetGridId;
+            public long SnapshotTick;
+            public long RequestUtcTicks;
+            public Vector3D Origin;
+            public Vector3D Forward;
+            public Vector3D Up;
+            public double Fov;
+            public double Range;
+        }
+
+        void VrageCageTickVirtualCapture()
+        {
+            if (vrageCageLiveInFlight || ticks < 60 || ticks % 6 != 0 || MyAPIGateway.Utilities == null)
+                return;
+
+            VrageCageLiveRequest request = null;
+            try
+            {
+                string raw;
+                using (TextReader reader = MyAPIGateway.Utilities.ReadFileInWorldStorage(
+                    VrageCageLiveRequestFile, typeof(PortalLcdSession)))
+                    raw = reader.ReadToEnd();
+                if (string.IsNullOrWhiteSpace(raw)) return;
+                request = VrageCageParseLiveRequest(raw);
+            }
+            catch (Exception ex)
+            {
+                string errorType = ex.GetType().Name;
+                if (errorType != "FileNotFoundException" && errorType != "DirectoryNotFoundException")
+                    MyLog.Default.WriteLineAndConsole("[VRageCage] live virtual request read failed: " + errorType);
+                return;
+            }
+
+            if (request == null || request.RequestId == vrageCageLiveLastRequestId) return;
+            vrageCageLiveLastRequestId = request.RequestId;
+            vrageCageLiveCurrentRequestId = request.RequestId;
+
+            string actualWorld = MyAPIGateway.Session != null ? MyAPIGateway.Session.Name : null;
+            if (!string.Equals(actualWorld, request.WorldName, StringComparison.Ordinal))
+            {
+                VrageCageRejectLiveRequest(request, "world-name-mismatch", actualWorld);
+                return;
+            }
+            double requestAge = (DateTime.UtcNow.Ticks - request.RequestUtcTicks) / (double)TimeSpan.TicksPerSecond;
+            if (requestAge < -2 || requestAge > VrageCageLiveMaximumRequestAgeSeconds)
+            {
+                VrageCageRejectLiveRequest(request, "request-expired-or-clock-mismatch", actualWorld);
+                return;
+            }
+
+            var entities = new HashSet<IMyEntity>();
+            MyAPIGateway.Entities.GetEntities(entities, delegate(IMyEntity e)
+            {
+                return e is Sandbox.Game.Entities.MyPlanet || e is IMyCubeGrid;
+            });
+            foreach (IMyEntity entity in entities)
+                if (entity is Sandbox.Game.Entities.MyPlanet)
+                {
+                    VrageCageRejectLiveRequest(request, "planet-terrain-unsupported", actualWorld);
+                    return;
+                }
+
+            WorkerRasterSlot slot = FindFreeLcdWorkerSlot();
+            if (slot == null) return;
+            vrageCageLiveVirtualProxies.Clear();
+            var selected = new List<IMyCubeGrid>();
+            foreach (IMyEntity entity in entities)
+            {
+                IMyCubeGrid grid = entity as IMyCubeGrid;
+                if (grid == null || grid.Closed || grid.MarkedForClose || !entity.Save) continue;
+                BoundingBoxD bounds = grid.WorldAABB;
+                double radius = bounds.HalfExtents.Length();
+                if (Vector3D.Distance(request.Origin, bounds.Center) - radius > request.Range) continue;
+                selected.Add(grid);
+            }
+            selected.Sort(delegate(IMyCubeGrid a, IMyCubeGrid b)
+            {
+                return Vector3D.DistanceSquared(request.Origin, a.WorldAABB.Center)
+                    .CompareTo(Vector3D.DistanceSquared(request.Origin, b.WorldAABB.Center));
+            });
+            if (selected.Count > 64)
+            {
+                VrageCageRejectLiveRequest(request, "grid-budget-exceeded", actualWorld);
+                return;
+            }
+            bool targetFound = false;
+            for (int i = 0; i < selected.Count; i++)
+            {
+                IMyCubeGrid grid = selected[i];
+                GridProxy proxy = new GridProxy();
+                proxy.Source = grid;
+                proxy.SourceId = grid.EntityId;
+                vrageCageLiveVirtualProxies.Add(grid.EntityId, proxy);
+                if (grid.EntityId == request.TargetGridId) targetFound = true;
+            }
+            if (!targetFound)
+            {
+                VrageCageRejectLiveRequest(request, "target-grid-not-in-bounded-scene", actualWorld);
+                return;
+            }
+
+            WorkerRasterSlot freeSlot = slot;
+            MatrixD cam = MatrixD.CreateWorld(request.Origin, request.Forward, request.Up);
+            double previousFov = portalFovDegrees;
+            double previousAspect = surfaceAspect;
+            int previousWidth = lcdRasterWidth;
+            int previousHeight = lcdRasterHeight;
+            try
+            {
+                portalFovDegrees = request.Fov;
+                surfaceAspect = 1;
+                lcdRasterWidth = VrageCageLiveWidth;
+                lcdRasterHeight = VrageCageLiveHeight;
+                PrepareStableRasterBlockScene(cam, vrageCageLiveVirtualProxies);
+
+                WorkerRasterJob job = freeSlot.Job;
+                job.VirtualIndex = 0;
+                job.OutputId = 0;
+                job.CameraEntityId = 0;
+                job.SurfaceIndex = -1;
+                job.Cam = cam;
+                job.FovDegrees = request.Fov;
+                job.Width = VrageCageLiveWidth;
+                job.Height = VrageCageLiveHeight;
+                job.OutputWidth = job.PresentationWidth = job.Width;
+                job.OutputHeight = job.PresentationHeight = job.Height;
+                job.GridRange = request.Range;
+                job.TerrainRange = 0;
+                job.TerrainReady = false;
+                job.HasPlanet = false;
+                job.WaterEnabled = false;
+                job.SunDirection = Vector3D.Up;
+                job.WeatherIntensity = 0;
+                job.SolarMultiplier = 1;
+                job.WeatherName = string.Empty;
+                job.LowPixels = new byte[job.Width * job.Height * 4];
+                job.ReusableDepth = new float[job.Width * job.Height];
+                for (int p = 0; p < job.Width * job.Height; p++)
+                {
+                    job.LowPixels[p * 4] = 3;
+                    job.LowPixels[p * 4 + 1] = 5;
+                    job.LowPixels[p * 4 + 2] = 9;
+                    job.LowPixels[p * 4 + 3] = 255;
+                }
+                job.Boxes.Clear();
+                job.Meshes.Clear();
+                job.Boulders.Clear();
+                job.DetectedTrees.Clear();
+                job.Projectiles.Clear();
+                job.GeneratedPixels = null;
+                job.GeneratedRects = null;
+                job.FinalPixels = null;
+                job.HistoryPixels = null;
+                job.HistoryWidth = job.HistoryHeight = 0;
+                job.CachedGridPixels = null;
+                job.CachedGridDepth = null;
+                job.CachedGridSignature = 0;
+                job.Error = null;
+                job.AntiAliasMode = 0;
+                job.FrameGeneration = false;
+                job.Sharpen = 0;
+                job.TemporalBlend = 0;
+                job.ExposureEv = 0;
+                job.Contrast = 1;
+                job.NightVision = false;
+                job.TextureMode = 0;
+                job.UpscaleMode = 0;
+                job.TerrainPoints = null;
+                job.TerrainColors = null;
+                job.TerrainValid = null;
+                job.TerrainSupportsTrees = null;
+                job.TerrainMaterialKeys = null;
+                job.SnapshotTick = ticks;
+                job.SnapshotUtcTicks = DateTime.UtcNow.Ticks;
+                SnapshotGridSceneForWorker(job);
+                freeSlot.Busy = true;
+                freeSlot.Completed = false;
+                vrageCageLiveInFlight = true;
+                MyAPIGateway.Parallel.StartBackground(delegate { RunWorkerRaster(job, freeSlot); });
+            }
+            catch (Exception ex)
+            {
+                freeSlot.Busy = false;
+                freeSlot.Completed = false;
+                vrageCageLiveInFlight = false;
+                VrageCageRejectLiveRequest(request, "raster-scheduling-failed-" + ex.GetType().Name, actualWorld);
+            }
+            finally
+            {
+                portalFovDegrees = previousFov;
+                surfaceAspect = previousAspect;
+                lcdRasterWidth = previousWidth;
+                lcdRasterHeight = previousHeight;
+            }
+        }
+
+        static VrageCageLiveRequest VrageCageParseLiveRequest(string raw)
+        {
+            var fields = new Dictionary<string, string>(StringComparer.Ordinal);
+            string[] lines = raw.Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].TrimEnd('\r');
+                int equals = line.IndexOf('=');
+                if (equals <= 0 || fields.ContainsKey(line.Substring(0, equals))) return null;
+                fields.Add(line.Substring(0, equals), line.Substring(equals + 1));
+            }
+            string schema;
+            string requestId;
+            string perspectiveId;
+            string scopeId;
+            string runId;
+            string worldName64;
+            string grid;
+            string snapshotTick;
+            string snapshotUtc64;
+            string requestUtcTicks;
+            string origin;
+            string forward;
+            string up;
+            string fov;
+            string range;
+            string width;
+            string height;
+            if (fields.Count != 17 || !fields.TryGetValue("schema", out schema) || schema != "voidwright-holoview-request-v1" ||
+                !fields.TryGetValue("request_id", out requestId) || !VrageCageIsHex(requestId, 32) ||
+                !fields.TryGetValue("perspective_id", out perspectiveId) || !VrageCageIsHex(perspectiveId, 32) ||
+                !fields.TryGetValue("world_scope_id", out scopeId) || !VrageCageIsHex(scopeId, 64) ||
+                !fields.TryGetValue("run_id", out runId) || !VrageCageIsHex(runId, 32) ||
+                !fields.TryGetValue("world_name_b64", out worldName64) ||
+                !fields.TryGetValue("target_grid_id", out grid) ||
+                !fields.TryGetValue("snapshot_simulation_tick", out snapshotTick) ||
+                !fields.TryGetValue("snapshot_captured_at_utc_b64", out snapshotUtc64) ||
+                !fields.TryGetValue("request_utc_ticks", out requestUtcTicks) ||
+                !fields.TryGetValue("origin", out origin) || !fields.TryGetValue("forward", out forward) ||
+                !fields.TryGetValue("up", out up) || !fields.TryGetValue("fov_degrees", out fov) ||
+                !fields.TryGetValue("range_meters", out range) || !fields.TryGetValue("width", out width) ||
+                !fields.TryGetValue("height", out height)) return null;
+            var request = new VrageCageLiveRequest();
+            try
+            {
+                request.RequestId = requestId;
+                request.PerspectiveId = perspectiveId;
+                request.WorldScopeId = scopeId;
+                request.RunId = runId;
+                request.WorldName = Encoding.UTF8.GetString(Convert.FromBase64String(worldName64));
+                request.SnapshotCapturedAtUtc = Encoding.UTF8.GetString(Convert.FromBase64String(snapshotUtc64));
+                request.TargetGridId = long.Parse(grid, CultureInfo.InvariantCulture);
+                request.SnapshotTick = long.Parse(snapshotTick, CultureInfo.InvariantCulture);
+                request.RequestUtcTicks = long.Parse(requestUtcTicks, CultureInfo.InvariantCulture);
+                request.Origin = VrageCageParseVector(origin);
+                request.Forward = VrageCageParseVector(forward);
+                request.Up = VrageCageParseVector(up);
+                request.Fov = double.Parse(fov, CultureInfo.InvariantCulture);
+                request.Range = double.Parse(range, CultureInfo.InvariantCulture);
+                if (int.Parse(width, CultureInfo.InvariantCulture) != VrageCageLiveWidth ||
+                    int.Parse(height, CultureInfo.InvariantCulture) != VrageCageLiveHeight ||
+                    request.TargetGridId <= 0 || request.SnapshotTick < 0 || request.WorldName.Length == 0 ||
+                    request.WorldName.Length > 128 || request.Fov < 25 || request.Fov > 100 ||
+                    request.Range < 10 || request.Range > 512 ||
+                    Math.Abs(request.Forward.Length() - 1) > 0.001 || Math.Abs(request.Up.Length() - 1) > 0.001 ||
+                    Math.Abs(Vector3D.Dot(request.Forward, request.Up)) > 0.001) return null;
+            }
+            catch { return null; }
+            return request;
+        }
+
+        static bool VrageCageIsHex(string value, int length)
+        {
+            if (value == null || value.Length != length) return false;
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
+            return true;
+        }
+
+        static Vector3D VrageCageParseVector(string text)
+        {
+            string[] pieces = text.Split(',');
+            if (pieces.Length != 3) throw new FormatException();
+            double x = double.Parse(pieces[0], CultureInfo.InvariantCulture);
+            double y = double.Parse(pieces[1], CultureInfo.InvariantCulture);
+            double z = double.Parse(pieces[2], CultureInfo.InvariantCulture);
+            if (double.IsNaN(x) || double.IsInfinity(x) || double.IsNaN(y) || double.IsInfinity(y) ||
+                double.IsNaN(z) || double.IsInfinity(z) || Math.Abs(x) > 10000000 ||
+                Math.Abs(y) > 10000000 || Math.Abs(z) > 10000000) throw new FormatException();
+            return new Vector3D(x, y, z);
+        }
+
+        void VrageCageCompleteVirtualFrame(WorkerRasterJob job)
+        {
+            vrageCageLiveInFlight = false;
+            VrageCageLiveRequest request;
+            try
+            {
+                using (TextReader reader = MyAPIGateway.Utilities.ReadFileInWorldStorage(
+                    VrageCageLiveRequestFile, typeof(PortalLcdSession)))
+                    request = VrageCageParseLiveRequest(reader.ReadToEnd());
+            }
+            catch { request = null; }
+            if (request == null || request.RequestId != vrageCageLiveCurrentRequestId)
+            {
+                vrageCageLiveCurrentRequestId = null;
+                return;
+            }
+            if (job.Error != null || job.FinalPixels == null ||
+                job.FinalPixels.Length != job.Width * job.Height * 4)
+            {
+                VrageCageRejectLiveRequest(request, "worker-raster-failed", MyAPIGateway.Session != null ? MyAPIGateway.Session.Name : null);
+                return;
+            }
+
+            string basename = "voidwright-live-capture-" + request.RequestId;
+            byte[] pixels = job.FinalPixels;
+            int visiblePixels = 0;
+            var colors = new HashSet<int>();
+            for (int p = 0; p < pixels.Length; p += 4)
+            {
+                byte r = pixels[p]; byte g = pixels[p + 1]; byte b = pixels[p + 2]; byte a = pixels[p + 3];
+                if (a >= 128 && Math.Max(r, Math.Max(g, b)) >= 16)
+                {
+                    visiblePixels++;
+                    colors.Add((r << 16) | (g << 8) | b);
+                }
+            }
+            using (TextWriter writer = MyAPIGateway.Utilities.WriteFileInWorldStorage(basename + ".rgba64.txt", typeof(PortalLcdSession)))
+                writer.Write(Convert.ToBase64String(pixels));
+
+            StringBuilder metadata = new StringBuilder(2048);
+            metadata.Append("{\"schema\":\"voidwright.holoview-live-capture.v1\",\"status\":\"complete\",\"source_kind\":\"holoview-software-render-virtual\"");
+            metadata.Append(",\"request_id\":\"").Append(request.RequestId).Append("\",\"perspective_id\":\"").Append(request.PerspectiveId).Append("\"");
+            metadata.Append(",\"world_scope_id\":\"").Append(request.WorldScopeId).Append("\",\"run_id\":\"").Append(request.RunId).Append("\"");
+            metadata.Append(",\"world_name_observed\":\"").Append(VrageCageJsonEscape(MyAPIGateway.Session.Name)).Append("\"");
+            metadata.Append(",\"renderer_session_id\":\"").Append(vrageCageLiveRendererSessionId).Append("\"");
+            metadata.Append(",\"target_grid_id\":").Append(request.TargetGridId.ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"structural_snapshot_tick\":").Append(request.SnapshotTick.ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"structural_snapshot_captured_at_utc\":\"").Append(VrageCageJsonEscape(request.SnapshotCapturedAtUtc)).Append("\"");
+            metadata.Append(",\"renderer_update_counter\":").Append(job.SnapshotTick.ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"captured_at_utc\":\"").Append(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)).Append("\"");
+            metadata.Append(",\"width\":").Append(job.Width.ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"height\":").Append(job.Height.ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"fov_degrees\":").Append(job.FovDegrees.ToString("R", CultureInfo.InvariantCulture));
+            metadata.Append(",\"range_meters\":").Append(request.Range.ToString("R", CultureInfo.InvariantCulture));
+            VrageCageAppendLiveVector(metadata, "origin", job.Cam.Translation);
+            VrageCageAppendLiveVector(metadata, "forward", job.Cam.Forward);
+            VrageCageAppendLiveVector(metadata, "up", job.Cam.Up);
+            metadata.Append(",\"source_grid_ids\":[");
+            bool first = true;
+            foreach (KeyValuePair<long, GridProxy> pair in vrageCageLiveVirtualProxies)
+            {
+                if (!first) metadata.Append(',');
+                first = false;
+                metadata.Append(pair.Key.ToString(CultureInfo.InvariantCulture));
+            }
+            metadata.Append("],\"geometry_primitives\":").Append((job.Boxes.Count + job.Meshes.Count).ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"visible_pixels\":").Append(visiblePixels.ToString(CultureInfo.InvariantCulture));
+            metadata.Append(",\"unique_visible_colors\":").Append(colors.Count.ToString(CultureInfo.InvariantCulture)).Append('}');
+            using (TextWriter writer = MyAPIGateway.Utilities.WriteFileInWorldStorage(basename + ".json", typeof(PortalLcdSession)))
+                writer.Write(metadata.ToString());
+            MyLog.Default.WriteLineAndConsole("[VRageCage] live virtual capture=" + request.RequestId +
+                " perspective=" + request.PerspectiveId + " update=" + job.SnapshotTick + " pixels=" + visiblePixels);
+            vrageCageLiveCurrentRequestId = null;
+        }
+
+        void VrageCageRejectLiveRequest(VrageCageLiveRequest request, string reason, string actualWorld)
+        {
+            if (request == null) return;
+            vrageCageLiveLastRequestId = request.RequestId;
+            vrageCageLiveCurrentRequestId = null;
+            StringBuilder metadata = new StringBuilder(512);
+            metadata.Append("{\"schema\":\"voidwright.holoview-live-capture.v1\",\"status\":\"rejected\",\"source_kind\":\"virtual\"");
+            metadata.Append(",\"request_id\":\"").Append(request.RequestId).Append("\",\"world_name_observed\":\"");
+            metadata.Append(VrageCageJsonEscape(actualWorld ?? "")).Append("\",\"reason\":\"");
+            metadata.Append(VrageCageJsonEscape(reason)).Append("\"}");
+            using (TextWriter writer = MyAPIGateway.Utilities.WriteFileInWorldStorage(
+                "voidwright-live-capture-" + request.RequestId + ".json", typeof(PortalLcdSession)))
+                writer.Write(metadata.ToString());
+            MyLog.Default.WriteLineAndConsole("[VRageCage] live virtual capture rejected=" + request.RequestId + " reason=" + reason);
+        }
+
+        static void VrageCageAppendLiveVector(StringBuilder text, string name, Vector3D value)
+        {
+            text.Append(",\"").Append(name).Append("\":[");
+            text.Append(value.X.ToString("R", CultureInfo.InvariantCulture)).Append(',');
+            text.Append(value.Y.ToString("R", CultureInfo.InvariantCulture)).Append(',');
+            text.Append(value.Z.ToString("R", CultureInfo.InvariantCulture)).Append(']');
+        }
+
+        static string VrageCageJsonEscape(string value)
+        {
+            if (value == null) return string.Empty;
+            return value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
+        }
+    }
+}

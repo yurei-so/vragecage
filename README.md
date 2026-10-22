@@ -31,6 +31,16 @@ SHA-256 hashes. A non-successful outcome exits nonzero.
 See [the architecture note](docs/architecture.md) for boundaries and the staged implementation
 plan, [the CLI contract](docs/cli.md) for commands and exit semantics, and
 [the worker guide](worker/README.md) for the real-engine smoke contract.
+For the offline spatial replay and evidence bundle, see [the replay guide](docs/spatial-replay.md)
+and the [Blue Truck startup-anomaly replay](artifacts/black-box-blue-truck-2026-10-21/index.html).
+
+The local higher-level tooling extension adds `lab-trial` for previewed,
+hash-bound, journaled GPS trials and `lab-trial-status` for recovery without
+replay. A connected operator may observe a disposable trial; arrival is
+reported separately from cleanup, and the worker stops only its owned run
+after fresh zero-human evidence. See [the CLI contract](docs/cli.md#higher-level-lab-trial).
+This extension is fixture-tested locally; live worker/plugin activation is
+separately gated.
 
 ## Real-engine CLI
 
@@ -67,11 +77,14 @@ vragecage prepare voidwright-native --engine magnetar --engine-ready
 vragecage stage-world voidwright-rover "/path/to/Space Engineers Save" --engine magnetar --engine-ready
 vragecage stage-world voidwright-lab "/path/to/Space Engineers Save" \
   --engine magnetar --engine-ready --destructive-lab
+# One initialization run lets Magnetar create its private source/profile documents.
+vragecage run voidwright-lab && vragecage wait voidwright-lab && vragecage stop voidwright-lab
 vragecage stage-plugin voidwright-lab /path/to/Voidwright/ServerPlugin \
   --id voidwright-server-plugin
 vragecage fixture-inspect voidwright-lab
 vragecage fixture-opt-in voidwright-lab CONTROLLER_ENTITY_ID --label "Camera Drone"
 vragecage lab-drive voidwright-lab CONTROLLER_ENTITY_ID --distance 2 --max-speed 1
+vragecage lab-sensor-frame voidwright-lab CAMERA_ENTITY_ID --width 32 --height 18 --range 150 --fov 70
 vragecage stage-mod voidwright-native /path/to/Voidwright --name Voidwright
 vragecage run voidwright-native
 vragecage wait voidwright-native

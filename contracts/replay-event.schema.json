@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vragecage.local/contracts/replay-event.schema.json",
+  "title": "VRageCage Replay Event",
+  "type": "object",
+  "required": ["schema", "event_id", "run_id", "category", "severity", "event_type", "simulation_tick", "simulation_time_s", "wall_time_utc", "entity_id", "command_id", "description", "details", "source_ref"],
+  "properties": {
+    "schema": {"const": "vragecage.replay-event.v1"},
+    "event_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": ["string", "null"]},
+    "condition": {"type": ["string", "null"]},
+    "category": {"type": "string", "minLength": 1},
+    "severity": {"type": "string", "enum": ["debug", "info", "warning", "error", "critical"]},
+    "event_type": {"type": "string", "minLength": 1},
+    "simulation_tick": {"type": ["integer", "null"], "minimum": 0},
+    "simulation_time_s": {"type": ["number", "null"]},
+    "wall_time_utc": {"type": ["string", "null"], "format": "date-time"},
+    "source_wall_time": {"type": ["string", "null"]},
+    "entity_id": {"type": ["string", "null"]},
+    "command_id": {"type": ["string", "null"]},
+    "description": {"type": "string"},
+    "details": {"type": "object"},
+    "source_ref": {"$ref": "spatial-sample.schema.json#/$defs/sourceRef"}
+  },
+  "additionalProperties": true
+}

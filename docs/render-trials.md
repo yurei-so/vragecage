@@ -1,11 +1,110 @@
 # Render trials
 
-VRageCage's dedicated worker is an authoritative simulation witness, not a visual witness. Space
-Engineers deliberately initializes a null renderer in dedicated mode. A render trial therefore uses
-one ordinary, non-dedicated game client connected to the disposable server and treats every image as
-supplemental evidence rather than simulation truth.
+VRageCage's dedicated worker is an authoritative simulation witness, not a native-game visual
+witness. Space Engineers deliberately initializes a null renderer in dedicated mode. HoloView 3D
+provides a separate headless-capable software rasterizer, however, and retains its completed LCD RGBA
+buffer with the camera pose, FOV, and source simulation tick. A bounded export from that buffer can
+therefore produce a useful camera-view video without a graphical client, Steam player session, or
+native framebuffer access.
 
-## Proposed first slice
+These are explicitly **HoloView software renders**, not native Space Engineers screenshots and not
+simulator ground truth. Earlier V2R3 captures demonstrated the RGBA buffer and pose metadata; periodic
+capture extends that same path by sampling a selected camera/LCD output every N simulation ticks.
+A bounded, LCD-free **grid-only** virtual-pose proof is now verified in a disposable space fixture;
+it is not yet a general render service or planet-terrain capture. See
+[virtual-camera-render.md](virtual-camera-render.md) for the implementation, two-pose receipt, and limits.
+Every exported frame is separately hashed and correlated with its simulation tick and camera pose.
+The run is bounded by frame count, byte count, raster dimensions, and simulation duration.
+
+For a stopped, disposable Magnetar instance only, `worker/instrument-holoview-capture.py` adds the
+periodic exporter to a clean, instance-local HoloView source copy. It accepts one to four explicit
+camera/LCD-output pairs, so views are sampled by the same simulation run. Each pair keeps its own
+cadence and frame-count budget; a shared byte budget bounds the combined export. Magnetar refreshes
+published Workshop content at load, so do not instrument its downloaded Workshop cache and expect
+the patch to survive. Instead, stage the instrumented tree under a unique local-mod name, then use
+`worker/replace-published-mod.py` to remove only the matching published HoloView dependency from the
+copied world's checkpoint/config. That helper backs up both files, writes a receipt, and has a
+hash-checked restore operation. The original Workshop tree, source save, and other instances remain
+untouched. The capture instrumenter refuses non-lab or running instances and records source hashes in
+`.vragecage-holoview-capture-<capture-id>.json`. Use repeated `--pair CAMERA_ID:OUTPUT_ID`; the older
+`--camera-id` plus `--output-id` form remains available for one view.
+
+After the run has stopped, collect the emitted `vragecage-hv-*.hvraw.txt` files from that world's mod
+storage. For one view, run `worker/holoview-frame-video.py INPUT_DIR --output OUTPUT.mp4`. For a
+synchronized comparison, run `worker/holoview-multiview-video.py INPUT_DIR --left-pair CAMERA:OUTPUT
+--right-pair CAMERA:OUTPUT --output OUTPUT.mp4`. Optional `--instance`, `--run-id`, and
+`--server-receipt-sha256` arguments add explicit correlation to either manifest. The multiview
+assembler joins frames only when their `snapshot_tick` values match exactly, omits unmatched frames,
+and does not interpolate. It labels both panels, records per-view camera pose and source hashes, and
+creates a variable-frame-rate MP4 from the shared tick sequence. Both assemblers validate raw RGBA
+lengths and capture identity, emit frame manifests, and never delete or overwrite raw inputs or
+existing outputs.
+
+The native client path remains intentionally deferred: the toolkit must not require its operator to
+own a game client or join as a player merely to exercise the free dedicated server. The separate
+server-only `lab-sensor-frame` command produces a low-resolution camera-aligned depth map from bounded
+physics rays. That depth artifact and the HoloView software-render artifact are different modalities;
+neither should be mislabeled as a native screenshot or simulator ground truth.
+
+## Periodic HoloView software capture
+
+The retained-frame export hook samples only the configured LCD entity and only when the render job's
+camera entity also matches the requested camera. It copies the completed RGBA array before the worker
+can reuse its buffers, then writes one `HVRAW1` record into mod world storage. The record contains the
+actual native raster dimensions and the larger LCD display dimensions separately, plus
+camera/output/surface IDs, FOV, camera origin/forward vector, and the job's source tick. This
+distinction matters because HoloView can scale a 256x256 retained buffer onto a 512x512 LCD. It does
+not issue camera commands or control the vehicle.
+
+Each sampled frame also gets a sibling `.scene.json` sidecar. Its stable join key is the capture ID,
+frame sequence, source tick, camera entity ID, LCD output entity ID, and surface index. The bounded
+payload records HoloView's own renderer-frustum candidate grids/entities and world AABBs; it is useful
+scene context, but it is **not** a detection made from pixels, a claim that every listed object was
+visible, or simulator ground truth. The extra metadata pass runs only at the configured sample cadence,
+scans at most 4,096 grid-block candidates, and serializes at most 64 objects by default (tunable with
+`--scene-max-objects`, hard maximum 512). The sidecar says when the inventory was truncated. The video
+manifest validates that each sidecar matches its raw frame and records the sidecar hash.
+
+This makes camera identity explicit in the observation contract and preserves per-camera streams in a
+multiview run. The synchronized assembler keeps each feed's camera/output identity and joins only
+equal source ticks; it never flattens the views into an anonymous feed or claims synchronization when
+the render jobs did not publish matching ticks.
+
+For the V2R3 overhead-drone fixture, the previously observed camera/output pair is:
+
+```text
+camera entity: 119411052923483830
+LCD output:    142523868888083493
+```
+
+The V2R3 Red obstacle-course truck has a known onboard pair that can be compared with that overhead
+tracker in one capture:
+
+```text
+onboard truck camera: 96346417539617834
+onboard LCD output:   94419542428808580
+overhead camera:      119411052923483830
+overhead LCD output:  142523868888083493
+```
+
+The default interval is 120 simulation ticks (nominally two seconds at 60 ticks/second), with at most
+60 frames, 64 MiB of estimated exported text, 512x512 native pixels per frame, and 7,200 ticks (two
+minutes) from first capture. These are upper bounds, not a promise of fixed wall-clock cadence:
+HoloView must finish and publish a render before a sample exists. The output video preserves
+source-tick spacing; it does not invent intermediate views or interpolate motion.
+
+Verified V2R3 run `379025977c4081868ddc869f33eda520` exported capture
+`v2r3-20261007-d`: 30 frames from ticks 16 through 3517, 256x256 native raster displayed at 512x512,
+sampled at least 120 ticks apart. The capture manifest carries the run ID and terminal server receipt
+hash. This is a time-lapse of one selected HoloView camera feed, not a claim that the camera moved or
+that the dedicated server captured a native framebuffer.
+
+Before instrumentation, verify the instance is stopped and disposable and that the IDs identify the
+intended output and camera in that copy. Do not instrument the original Workshop tree or a source save.
+The mod compiles at world load; capture failures are logged and terminate the bounded exporter without
+affecting simulation control. Inspect the resulting frame manifest alongside the server run receipt.
+
+## Native framebuffer client witness (deferred)
 
 The first implementation should run the render client on the workstation that already owns and runs
 Space Engineers. The simulation server remains isolated on the worker. This is a LAN client/server

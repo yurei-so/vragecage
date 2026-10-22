@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vragecage.local/contracts/spatial-sample.schema.json",
+  "title": "VRageCage Spatial Sample",
+  "type": "object",
+  "required": ["schema", "run_id", "fixture_id", "world_id", "session_name", "sequence", "entity_id", "position_m", "orientation_xyzw", "linear_velocity_mps", "angular_velocity_radps", "simulation_tick", "simulation_time_s", "wall_time_utc", "source_wall_time", "source_ref"],
+  "properties": {
+    "schema": {"const": "vragecage.spatial-sample.v1"},
+    "run_id": {"type": ["string", "null"]},
+    "fixture_id": {"type": ["string", "null"]},
+    "world_id": {"type": ["string", "null"]},
+    "session_name": {"type": ["string", "null"]},
+    "condition": {"type": ["string", "null"]},
+    "sequence": {"type": "integer", "minimum": 0},
+    "sample_kind": {"type": ["string", "null"]},
+    "entity_id": {"type": ["string", "null"]},
+    "controller_entity_id": {"type": ["string", "null"]},
+    "entity_type": {"type": ["string", "null"]},
+    "position_m": {"$ref": "#/$defs/vector3"},
+    "orientation_xyzw": {"oneOf": [{"$ref": "#/$defs/vector4"}, {"type": "null"}]},
+    "linear_velocity_mps": {"oneOf": [{"$ref": "#/$defs/vector3"}, {"type": "null"}]},
+    "linear_speed_mps": {"type": ["number", "null"]},
+    "angular_velocity_radps": {"oneOf": [{"$ref": "#/$defs/vector3"}, {"type": "null"}]},
+    "angular_speed_radps": {"type": ["number", "null"]},
+    "simulation_tick": {"type": ["integer", "null"], "minimum": 0},
+    "simulation_time_s": {"type": ["number", "null"]},
+    "wall_time_utc": {"type": ["string", "null"], "format": "date-time"},
+    "source_wall_time": {"type": ["string", "null"]},
+    "source_timezone": {"type": ["string", "null"]},
+    "actuators": {"type": ["object", "array", "null"]},
+    "actuator_states": {"type": ["array", "null"]},
+    "command_id": {"type": ["string", "null"]},
+    "uncertainty": {"type": ["string", "array", "null"]},
+    "source_ref": {"$ref": "#/$defs/sourceRef"}
+  },
+  "$defs": {
+    "vector3": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+    "vector4": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+    "sourceRef": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "line": {"type": ["integer", "null"], "minimum": 1}}, "additionalProperties": true}
+  },
+  "additionalProperties": true
+}

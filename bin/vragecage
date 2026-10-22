@@ -2,16 +2,25 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import fcntl
 import hashlib
+import ipaddress
+import io
 import json
+import math
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
 import sys
+import socket
 import time
+import tempfile
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -20,6 +29,10 @@ INSTANCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENGINES = ("proton", "magnetar")
 MAX_UPLOAD_FILES = 100_000
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+PASSIVE_TELEMETRY_MAX_BYTES = 64 * 1024 * 1024
+PASSIVE_TELEMETRY_MAX_SUMMARY_BYTES = 64 * 1024
+PASSIVE_TELEMETRY_MAX_LINE_BYTES = 1024 * 1024
+PASSIVE_TELEMETRY_ENVELOPE_MAGIC = b"VWDT1\n"
 
 
 def emit(value: object) -> None:
@@ -34,10 +47,26 @@ def validate_instance(value: str) -> str:
     return value
 
 
+def validate_run_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise argparse.ArgumentTypeError("run ID must be 32 lowercase hexadecimal characters")
+    return value
+
+
 def validate_observation_requirement(value: str) -> str:
     if not value or len(value) > 128 or "\n" in value or "\r" in value:
         raise argparse.ArgumentTypeError("observation requirement must be 1-128 characters on one line")
     return value
+
+
+def validate_motion_telemetry_interval(value: str) -> int:
+    try:
+        interval = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("motion telemetry interval must be an integer") from error
+    if interval < 1 or interval > 600:
+        raise argparse.ArgumentTypeError("motion telemetry interval must be 1-600 simulation ticks")
+    return interval
 
 
 def validate_upload_tree(root: Path) -> tuple[int, int]:
@@ -89,6 +118,311 @@ def script(name: str) -> str:
 
 def instance_path(instance: str) -> Path:
     return worker_root() / "instances" / instance
+
+
+def _json_no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _load_passive_json(raw: bytes, label: str) -> object:
+    try:
+        return json.loads(raw, object_pairs_hook=_json_no_duplicate_keys,
+                          parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid number: {value}")))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+        raise SystemExit(f"invalid passive telemetry {label}: {error}") from error
+
+
+def _confined_regular_file(path: Path, root: Path, maximum: int) -> bytes:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise SystemExit(f"passive telemetry artifact is unavailable: {path.name}") from error
+    if not stat.S_ISREG(mode) or path.is_symlink():
+        raise SystemExit(f"passive telemetry artifact must be a regular non-symlink file: {path.name}")
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise SystemExit("passive telemetry artifact escaped the selected instance") from error
+    size = path.stat().st_size
+    if size < 0 or size > maximum:
+        raise SystemExit(f"passive telemetry artifact exceeds its {maximum}-byte limit: {path.name}")
+    raw = path.read_bytes()
+    if len(raw) != size:
+        raise SystemExit(f"passive telemetry artifact changed while being read: {path.name}")
+    return raw
+
+
+def _passive_plugin_tree_hash(root: Path) -> str:
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit("read-only telemetry plugin package is missing or unsafe")
+    digest = hashlib.sha256()
+    files = 0
+    total = 0
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if path.is_symlink():
+            raise SystemExit("read-only telemetry plugin package contains a symbolic link")
+        if not path.is_file():
+            continue
+        files += 1
+        total += path.stat().st_size
+        if files > 10_000 or total > 256 * 1024 * 1024:
+            raise SystemExit("read-only telemetry plugin package exceeds its staging bounds")
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _validate_passive_capture(jsonl: bytes, summary: object, run_id: str) -> dict[str, object]:
+    if not isinstance(summary, dict) or summary.get("schemaVersion") != 1 or \
+            summary.get("source") != "server-passive-grid" or \
+            summary.get("permissionScope") != "read_only_observation" or \
+            summary.get("runId") != run_id:
+        raise SystemExit("passive telemetry summary does not match the requested run and read-only contract")
+    session_id = summary.get("sessionId")
+    grid_id = summary.get("gridEntityId")
+    player_id = summary.get("playerIdentityId")
+    record_count = summary.get("recordCount")
+    dropped_total = summary.get("droppedRecordsTotal")
+    max_rate = summary.get("maximumSampleRateHz")
+    if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f]{32}", session_id) or \
+            not isinstance(grid_id, int) or isinstance(grid_id, bool) or grid_id <= 0 or \
+            not isinstance(player_id, int) or isinstance(player_id, bool) or player_id <= 0 or \
+            not isinstance(record_count, int) or isinstance(record_count, bool) or not 0 <= record_count <= 100_000 or \
+            not isinstance(dropped_total, int) or isinstance(dropped_total, bool) or dropped_total < 0 or \
+            not isinstance(max_rate, int) or isinstance(max_rate, bool) or not 1 <= max_rate <= 10:
+        raise SystemExit("passive telemetry summary identity or bounds are invalid")
+    buffered_bytes = summary.get("bufferedBytes")
+    if not isinstance(buffered_bytes, int) or isinstance(buffered_bytes, bool) or buffered_bytes != len(jsonl):
+        raise SystemExit("passive telemetry summary byte count does not match the JSONL file")
+
+    records = []
+    if jsonl:
+        if not jsonl.endswith(b"\n"):
+            raise SystemExit("passive telemetry JSONL is missing its final line terminator")
+        lines = jsonl.splitlines()
+        if len(lines) != record_count:
+            raise SystemExit("passive telemetry record count does not match its summary")
+        prior_dropped = -1
+        prior_tick = -1
+        prior_time = -1.0
+        for expected_sequence, line in enumerate(lines, 1):
+            if not line or len(line) > PASSIVE_TELEMETRY_MAX_LINE_BYTES:
+                raise SystemExit("passive telemetry JSONL contains an empty or oversized record")
+            record = _load_passive_json(line, "record")
+            record_grid_id = record.get("gridEntityId") if isinstance(record, dict) else None
+            record_sequence = record.get("sequence") if isinstance(record, dict) else None
+            if not isinstance(record, dict) or record.get("schemaVersion") != 1 or \
+                    record.get("runId") != run_id or record.get("sessionId") != session_id or \
+                    not isinstance(record_grid_id, int) or isinstance(record_grid_id, bool) or record_grid_id != grid_id or \
+                    record.get("source") != "server-passive-grid" or \
+                    not isinstance(record_sequence, int) or isinstance(record_sequence, bool) or record_sequence != expected_sequence or \
+                    record.get("clockDomain") != "server-simulation":
+                raise SystemExit("passive telemetry record identity, source, or sequence is inconsistent")
+            captured = record.get("capturedAtUtc")
+            if not isinstance(captured, str) or not captured.endswith("Z"):
+                raise SystemExit("passive telemetry record lacks a UTC source timestamp")
+            try:
+                datetime.fromisoformat(captured[:-1] + "+00:00")
+            except ValueError as error:
+                raise SystemExit("passive telemetry record has an invalid UTC source timestamp") from error
+            tick = record.get("simulationTick")
+            sim_time = record.get("simulationTimeSeconds")
+            dropped = record.get("droppedRecordsTotal")
+            if not isinstance(tick, int) or isinstance(tick, bool) or tick < prior_tick or \
+                    not isinstance(sim_time, (int, float)) or isinstance(sim_time, bool) or not math.isfinite(sim_time) or sim_time < prior_time or \
+                    not isinstance(dropped, int) or isinstance(dropped, bool) or dropped < prior_dropped:
+                raise SystemExit("passive telemetry tick, time, or drop counter moved backwards")
+            input_section = record.get("humanInput")
+            if not isinstance(input_section, dict) or input_section.get("status") != "unavailable":
+                raise SystemExit("passive telemetry must keep human input unavailable")
+            actuators = record.get("actuators")
+            if isinstance(actuators, dict) and actuators.get("status") != "unavailable":
+                value = actuators.get("value")
+                if not isinstance(value, dict) or value.get("ownership") != "observed_only_no_control":
+                    raise SystemExit("passive telemetry actuator data is not observation-only")
+            prior_tick = tick
+            prior_time = float(sim_time)
+            prior_dropped = dropped
+            records.append(record)
+    if record_count and prior_dropped > dropped_total:
+        raise SystemExit("passive telemetry summary drop count precedes a record counter")
+    return {
+        "run_id": run_id,
+        "session_id": session_id,
+        "grid_entity_id": grid_id,
+        "record_count": record_count,
+        "dropped_records_total": dropped_total,
+        "maximum_sample_rate_hz": max_rate,
+        "jsonl_sha256": hashlib.sha256(jsonl).hexdigest(),
+        "summary_sha256": hashlib.sha256(json.dumps(summary, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+    }
+
+
+def collect_passive_telemetry(instance: str, run_id: str) -> tuple[bytes, bytes, dict[str, object]]:
+    root = instance_path(instance)
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit("passive telemetry retrieval requires an existing non-symlink instance")
+    resolved_root = root.resolve(strict=True)
+    instances_root = (worker_root() / "instances").resolve(strict=True)
+    try:
+        if resolved_root.parent != instances_root:
+            raise SystemExit("selected instance is outside the configured VRageCage worker")
+    except OSError as error:
+        raise SystemExit("configured VRageCage worker instance root is unavailable") from error
+    engine_marker = resolved_root / ".vragecage-engine"
+    if not engine_marker.is_file() or engine_marker.is_symlink() or engine_marker.read_text().strip() != "magnetar":
+        raise SystemExit("passive telemetry retrieval requires the exact Magnetar disposable instance")
+    lab_path = resolved_root / ".vragecage-lab.json"
+    if lab_path.exists() or lab_path.is_symlink():
+        if lab_path.is_symlink() or not lab_path.is_file():
+            raise SystemExit("passive telemetry lab contract is not a regular file")
+        lab = _load_passive_json(_confined_regular_file(lab_path, resolved_root, 64 * 1024), "lab contract")
+        if not isinstance(lab, dict) or lab.get("authority") != "destructive-lab" or lab.get("instance") != instance:
+            raise SystemExit("passive telemetry lab contract does not match the selected instance")
+    else:
+        observer_path = resolved_root / ".vragecage-passive-telemetry.json"
+        observer = _load_passive_json(
+            _confined_regular_file(observer_path, resolved_root, 64 * 1024), "read-only observer contract")
+        expected = {
+            "schema": "vragecage.passive-telemetry-authority.v1",
+            "authority": "read_only_observation",
+            "instance": instance,
+            "engine": "magnetar",
+            "plugin_id": "voidwright-passive-telemetry",
+            "capabilities": ["player-consented-passive-grid-telemetry"],
+            "denied_capabilities": ["movement", "actuator-control",
+                                    "programmable-block-script-control", "world-entity-mutation"],
+        }
+        if not isinstance(observer, dict) or any(observer.get(key) != value for key, value in expected.items()):
+            raise SystemExit("passive telemetry observer contract does not match the selected instance")
+        stage = _load_passive_json(_confined_regular_file(
+            resolved_root / ".vragecage-passive-telemetry-stage.json", resolved_root, 64 * 1024),
+            "read-only observer stage receipt")
+        plugin_root = resolved_root / "Plugins"
+        if plugin_root.is_symlink() or not plugin_root.is_dir():
+            raise SystemExit("passive telemetry plugin root is missing or unsafe")
+        package_hash = _passive_plugin_tree_hash(plugin_root / "voidwright-passive-telemetry")
+        if (not isinstance(stage, dict) or stage.get("instance") != instance or
+                stage.get("plugin_id") != "voidwright-passive-telemetry" or
+                stage.get("tree_sha256") != package_hash or
+                observer.get("plugin_tree_sha256") != package_hash):
+            raise SystemExit("passive telemetry observer package does not match its stage receipt")
+
+    jsonl_name = f"driving-lab-passive-{run_id}.jsonl"
+    summary_name = f"driving-lab-passive-{run_id}.summary.json"
+    candidates: list[Path] = []
+    for directory, subdirectories, filenames in os.walk(resolved_root, followlinks=False):
+        current = Path(directory)
+        subdirectories[:] = [name for name in subdirectories
+                             if not (current / name).is_symlink() and name not in {"Quarantine", "Plugins"}]
+        if current.name != "VRage.Game" or current.parent.name != "Storage":
+            continue
+        if jsonl_name in filenames and summary_name in filenames:
+            candidates.append(current)
+    if len(candidates) != 1:
+        raise SystemExit("expected exactly one completed passive telemetry artifact pair in this instance")
+    storage = candidates[0]
+    jsonl_path = storage / jsonl_name
+    summary_path = storage / summary_name
+    jsonl = _confined_regular_file(jsonl_path, resolved_root, PASSIVE_TELEMETRY_MAX_BYTES)
+    summary_raw = _confined_regular_file(summary_path, resolved_root, PASSIVE_TELEMETRY_MAX_SUMMARY_BYTES)
+    summary = _load_passive_json(summary_raw, "summary")
+    metadata = _validate_passive_capture(jsonl, summary, run_id)
+    metadata["jsonl_sha256"] = hashlib.sha256(jsonl).hexdigest()
+    metadata["summary_sha256"] = hashlib.sha256(summary_raw).hexdigest()
+    metadata["jsonl_size_bytes"] = len(jsonl)
+    metadata["summary_size_bytes"] = len(summary_raw)
+    return jsonl, summary_raw, metadata
+
+
+def write_passive_telemetry_envelope(stream, run_id: str, jsonl: bytes, summary: bytes) -> None:
+    entries = [
+        {"name": f"driving-lab-passive-{run_id}.jsonl", "size": len(jsonl), "sha256": hashlib.sha256(jsonl).hexdigest()},
+        {"name": f"driving-lab-passive-{run_id}.summary.json", "size": len(summary), "sha256": hashlib.sha256(summary).hexdigest()},
+    ]
+    stream.write(PASSIVE_TELEMETRY_ENVELOPE_MAGIC)
+    stream.write((json.dumps({"schema": "vragecage.passive-telemetry-export.v1", "files": entries},
+                            sort_keys=True, separators=(",", ":")) + "\n").encode())
+    stream.write(jsonl)
+    stream.write(summary)
+
+
+def _read_exact(stream, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.read(min(1024 * 1024, size - len(chunks)))
+        if not chunk:
+            raise SystemExit("telemetry export stream ended before the declared file size")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def read_passive_telemetry_envelope(stream, run_id: str) -> tuple[bytes, bytes]:
+    if _read_exact(stream, len(PASSIVE_TELEMETRY_ENVELOPE_MAGIC)) != PASSIVE_TELEMETRY_ENVELOPE_MAGIC:
+        raise SystemExit("remote worker returned an invalid telemetry export header")
+    header_line = stream.readline(8193)
+    if not header_line or len(header_line) > 8192 or not header_line.endswith(b"\n"):
+        raise SystemExit("remote worker returned an oversized or incomplete telemetry export header")
+    header = _load_passive_json(header_line, "export header")
+    expected_names = [f"driving-lab-passive-{run_id}.jsonl", f"driving-lab-passive-{run_id}.summary.json"]
+    if not isinstance(header, dict) or header.get("schema") != "vragecage.passive-telemetry-export.v1" or \
+            not isinstance(header.get("files"), list) or len(header["files"]) != 2:
+        raise SystemExit("remote worker returned an invalid telemetry export manifest")
+    payloads = []
+    for item, expected_name, maximum in zip(header["files"], expected_names,
+                                            (PASSIVE_TELEMETRY_MAX_BYTES, PASSIVE_TELEMETRY_MAX_SUMMARY_BYTES)):
+        if not isinstance(item, dict) or item.get("name") != expected_name:
+            raise SystemExit("remote telemetry export attempted to return an unexpected filename")
+        size = item.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= maximum:
+            raise SystemExit("remote telemetry export declared an invalid file size")
+        raw = _read_exact(stream, size)
+        if item.get("sha256") != hashlib.sha256(raw).hexdigest():
+            raise SystemExit("remote telemetry export hash did not match its manifest")
+        payloads.append(raw)
+    if stream.read(1):
+        raise SystemExit("remote telemetry export contained bytes beyond the declared files")
+    return payloads[0], payloads[1]
+
+
+def store_passive_telemetry(output_dir: Path, run_id: str, jsonl: bytes, summary: bytes) -> list[str]:
+    if output_dir.exists() and output_dir.is_symlink():
+        raise SystemExit("telemetry output directory cannot be a symlink")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.resolve(strict=True)
+    files = [
+        (output_dir / f"driving-lab-passive-{run_id}.jsonl", jsonl),
+        (output_dir / f"driving-lab-passive-{run_id}.summary.json", summary),
+    ]
+    for path, payload in files:
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
+                raise SystemExit(f"refusing to replace a different telemetry export: {path.name}")
+            os.chmod(path, 0o600)
+            continue
+        descriptor, temp_name = tempfile.mkstemp(prefix=".telemetry-", dir=str(output_dir))
+        temporary = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    return [str(path) for path, _ in files]
 
 
 def instance_engine(instance: str) -> str:
@@ -214,6 +548,559 @@ def unit_name(instance: str) -> str:
     return f"vragecage-{instance}.service"
 
 
+def write_lab_bootstrap(instance: Path, active: dict[str, object]) -> None:
+    config = instance / "SpaceEngineers-Dedicated.cfg"
+    if config.is_symlink() or not config.is_file():
+        raise SystemExit("lab bootstrap requires the selected instance's dedicated-server config")
+    try:
+        load_world = ET.parse(config).getroot().findtext("LoadWorld")
+    except (OSError, ET.ParseError) as error:
+        raise SystemExit(f"lab bootstrap could not read the configured LoadWorld path: {error}") from error
+    if not load_world:
+        raise SystemExit("lab bootstrap requires an explicit LoadWorld path")
+    world = Path(load_world)
+    if not world.is_absolute():
+        world = instance / world
+    world = world.resolve(strict=True)
+    try:
+        world.relative_to(instance.resolve(strict=True))
+    except ValueError as error:
+        raise SystemExit("configured LoadWorld path escaped the selected instance") from error
+    sandbox = world / "Sandbox.sbc"
+    if sandbox.is_symlink() or not sandbox.is_file():
+        raise SystemExit("lab bootstrap requires the configured LoadWorld's Sandbox.sbc")
+    try:
+        session_name = ET.parse(sandbox).getroot().findtext("SessionName")
+    except (OSError, ET.ParseError) as error:
+        raise SystemExit(f"lab bootstrap could not read the loaded world's session name: {error}") from error
+    if (not session_name or session_name in {".", ".."} or
+            Path(session_name).name != session_name or "/" in session_name or "\\" in session_name):
+        raise SystemExit("lab bootstrap requires a safe SessionName from the loaded world")
+    storage = instance / "Saves" / session_name / "Storage"
+    if storage.is_symlink():
+        raise SystemExit("lab bootstrap storage must not be a symbolic link")
+    storage.mkdir(mode=0o700, parents=True, exist_ok=True)
+    resolved_storage = storage.resolve(strict=True)
+    try:
+        resolved_storage.relative_to(instance.resolve(strict=True))
+    except ValueError as error:
+        raise SystemExit("lab bootstrap storage escaped the selected instance") from error
+    value = {
+        "schema": "vragecage.lab-bootstrap.v1",
+        "runId": active.get("run_id", ""),
+        "fixtureId": active.get("fixture_id", ""),
+        "bootstrapNonce": active.get("bootstrap_nonce", ""),
+        "baselineDiscoveryRunId": active.get("baseline_discovery_run_id", ""),
+    }
+    raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+    host_storage = storage / "VRage.Game"
+    if host_storage.is_symlink():
+        raise SystemExit("host bootstrap storage must not be a symbolic link")
+    host_storage.mkdir(mode=0o700, exist_ok=True)
+    try:
+        host_storage.resolve(strict=True).relative_to(instance.resolve(strict=True))
+    except ValueError as error:
+        raise SystemExit("host bootstrap storage escaped the selected instance") from error
+    targets = [host_storage / "vragecage-lab-bootstrap-v1.json"]
+    staged_mod_path = instance / ".vragecage-mod-stage.json"
+    if staged_mod_path.exists() or staged_mod_path.is_symlink():
+        if staged_mod_path.is_symlink() or not staged_mod_path.is_file():
+            raise SystemExit("mod stage receipt is unsafe while writing lab bootstrap")
+        staged_mod = json.loads(staged_mod_path.read_text(encoding="utf-8"))
+        mod_name = staged_mod.get("name") if isinstance(staged_mod, dict) else None
+        workshop_id = staged_mod.get("synthetic_workshop_id") if isinstance(staged_mod, dict) else None
+        if (not isinstance(mod_name, str) or not INSTANCE_PATTERN.fullmatch(mod_name) or
+                not isinstance(workshop_id, int) or isinstance(workshop_id, bool) or workshop_id <= 0):
+            raise SystemExit("mod stage receipt lacks a safe world-storage identity")
+        # MyAPIGateway.Utilities world storage uses the mod assembly name,
+        # which is independent from modinfo.sbmi's display name.
+        assembly_name = "Voidwright"
+        mod_storage = storage / f"{workshop_id}.sbm_{assembly_name}"
+        if mod_storage.is_symlink():
+            raise SystemExit("mod bootstrap storage must not be a symbolic link")
+        mod_storage.mkdir(mode=0o700, exist_ok=True)
+        try:
+            mod_storage.resolve(strict=True).relative_to(instance.resolve(strict=True))
+        except ValueError as error:
+            raise SystemExit("mod bootstrap storage escaped the selected instance") from error
+        targets.append(mod_storage / "vragecage-lab-bootstrap-v1.json")
+
+    for path in targets:
+        if path.is_symlink():
+            raise SystemExit("lab bootstrap file must not be a symbolic link")
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".vragecage-lab-bootstrap-", dir=path.parent)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, path)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+
+def _magnetar_package_tree_hash(root: Path) -> str:
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit("Magnetar local package cache is missing or unsafe")
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if path.is_symlink():
+            raise SystemExit("Magnetar local package cache contains a symbolic link")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _validate_local_vehicle_test_instrumentation(instance: Path, instance_name: str,
+                                                  source_tree_sha256: str,
+                                                  configured_camera_id: object) -> int:
+    if instance_name == "land-local-test-hydro-scout-20261022-c":
+        expected_source = "33400d8eb2a43e555856a3d48c035a784c6fa8f5453d524782372c28df9eeff4"
+        if source_tree_sha256 != expected_source or type(configured_camera_id) is not int or \
+                configured_camera_id != 6902088205773520808:
+            raise SystemExit("Hydro Scout camera binding is not tied to the exact reviewed clone")
+        sector_path = instance / "World" / "SANDBOX_0_0_0_.sbs"
+        try:
+            sector_raw = sector_path.read_bytes()
+            sector_root = ET.fromstring(sector_raw)
+        except (OSError, ET.ParseError) as error:
+            raise SystemExit("Hydro Scout sector is missing or invalid") from error
+        xsi_type = "{http://www.w3.org/2001/XMLSchema-instance}type"
+        expected_grids = {
+            "143344737461122310", "113504086011869676", "83781654658335329",
+            "101822873690952882", "90663942980601709", "143998760294003094",
+        }
+        grid_entities = [entity for entity in sector_root.iter("MyObjectBuilder_EntityBase")
+                         if entity.get(xsi_type) == "MyObjectBuilder_CubeGrid"]
+        grid_by_id = {entity.findtext("EntityId"): entity for entity in grid_entities}
+        if len(grid_entities) != len(expected_grids) or set(grid_by_id) != expected_grids:
+            raise SystemExit("Hydro Scout sector grid inventory differs from the exact six-grid fixture")
+        non_grids = [entity for entity in sector_root.iter("MyObjectBuilder_EntityBase")
+                     if entity.get(xsi_type) != "MyObjectBuilder_CubeGrid"]
+        if len(non_grids) != 1 or non_grids[0].get(xsi_type) != "MyObjectBuilder_Planet":
+            raise SystemExit("Hydro Scout sector contains an unexpected non-grid entity")
+        rover = grid_by_id["113504086011869676"]
+        rover_block_node = rover.find("CubeBlocks")
+        blocks = list(rover_block_node) if rover_block_node is not None else []
+        controller = [block for block in blocks if block.findtext("EntityId") == "112711005364517351" and
+                      block.get(xsi_type) == "MyObjectBuilder_Cockpit"]
+        camera = [block for block in blocks if block.findtext("EntityId") == str(configured_camera_id) and
+                  block.get(xsi_type) == "MyObjectBuilder_CameraBlock"]
+        all_blocks = {block.findtext("EntityId"): (grid, block)
+                      for grid in grid_entities for block in grid.findall("./CubeBlocks/*")
+                      if block.findtext("EntityId")}
+        expected_wheels = {
+            "135633742662929758": "83781654658335329",
+            "92672912164488213": "101822873690952882",
+            "129575574301717563": "90663942980601709",
+            "72699375256551291": "143998760294003094",
+        }
+        wheel_map = {}
+        for block in blocks:
+            if block.get(xsi_type) != "MyObjectBuilder_MotorSuspension":
+                continue
+            top = all_blocks.get(block.findtext("TopBlockId"))
+            if top is not None:
+                wheel_map[block.findtext("EntityId")] = top[0].findtext("EntityId")
+            for field in ("PropulsionOverride", "SteeringOverride", "SteerAngle"):
+                raw = block.findtext(field)
+                if raw is not None and (not math.isfinite(float(raw)) or abs(float(raw)) > 1e-7):
+                    raise SystemExit("Hydro Scout saved wheel overrides are not neutral")
+        platform = grid_by_id["143344737461122310"]
+        platform_block_node = platform.find("CubeBlocks")
+        platform_blocks = list(platform_block_node) if platform_block_node is not None else []
+        gravity = [block for block in platform_blocks
+                   if block.findtext("EntityId") == "86965797009458869" and
+                   block.get(xsi_type) == "MyObjectBuilder_GravityGenerator" and
+                   block.findtext("Enabled", "").lower() == "true"]
+        if (len(controller) != 1 or len(camera) != 1 or wheel_map != expected_wheels or len(gravity) != 1):
+            raise SystemExit("Hydro Scout controller/camera/wheel map/gravity identity check failed")
+        return configured_camera_id
+    ledger_path = instance / ".vragecage-diagnostic-instrumentation.json"
+    sector_path = instance / "World" / "SANDBOX_0_0_0_.sbs"
+    try:
+        if (ledger_path.is_symlink() or not stat.S_ISREG(ledger_path.lstat().st_mode) or
+                sector_path.is_symlink() or not stat.S_ISREG(sector_path.lstat().st_mode)):
+            raise OSError("instrumentation ledger and target sector must be regular non-symlink files")
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"), object_pairs_hook=_json_no_duplicate_keys)
+        sector_raw = sector_path.read_bytes()
+        sector_hash = hashlib.sha256(sector_raw).hexdigest()
+        sector_root = ET.fromstring(sector_raw)
+    except (OSError, json.JSONDecodeError, ValueError, ET.ParseError) as error:
+        raise SystemExit("isolated-clear mode requires a valid camera instrumentation ledger") from error
+    added = ledger.get("added_blocks") if isinstance(ledger, dict) else None
+    controller = ledger.get("controller") if isinstance(ledger, dict) else None
+    if (not isinstance(ledger, dict) or
+            ledger.get("schema") != "vragecage.diagnostic-instrumentation.v1" or
+            ledger.get("instance") != instance_name or
+            ledger.get("authority") != "disposable-clone-only" or
+            ledger.get("source_tree_sha256") != source_tree_sha256 or
+            ledger.get("sector_after_sha256") != sector_hash or
+            not isinstance(added, list) or len(added) != 2 or not isinstance(controller, dict) or
+            controller.get("entity_id") != "83468039688685570" or
+            not isinstance(ledger.get("existing_suspension_ids"), list) or
+            sorted(str(value) for value in ledger.get("existing_suspension_ids", [])) != [
+                "102872810511526201", "72448287472244394", "87663115116726466", "95379321851010785"
+            ]):
+        raise SystemExit("isolated-clear instrumentation does not match the pinned Blue Truck and suspension inventory")
+    camera = next((item for item in added if isinstance(item, dict) and item.get("subtype") == "SmallCameraBlock"), None)
+    core = next((item for item in added if isinstance(item, dict) and
+                 item.get("subtype") == "VoidwrightNavigationControllerSmall"), None)
+    camera_id = camera.get("entity_id") if camera else None
+    if (camera is None or core is None or camera.get("grid_name") != "Blue Truck" or
+            core.get("grid_name") != "Blue Truck" or camera.get("grid_id") != "105034224363529183" or
+            core.get("grid_id") != "105034224363529183" or
+            not isinstance(camera_id, str) or not camera_id.isdigit() or
+            type(configured_camera_id) is not int or int(camera_id) != configured_camera_id):
+        raise SystemExit("isolated-clear camera id is not bound to the exact instrumented Blue Truck")
+    xsi_type = "{http://www.w3.org/2001/XMLSchema-instance}type"
+    target_grids = [entity for entity in sector_root.iter("MyObjectBuilder_EntityBase")
+                    if entity.get(xsi_type) == "MyObjectBuilder_CubeGrid" and
+                    entity.findtext("EntityId") == "105034224363529183" and
+                    entity.findtext("DisplayName") == "Blue Truck"]
+    if len(target_grids) != 1:
+        raise SystemExit("instrumented sector does not contain the unique pinned Blue Truck")
+    target_blocks = target_grids[0].find("CubeBlocks")
+    if target_blocks is None or len(list(target_blocks)) != 87:
+        raise SystemExit("instrumented Blue Truck does not have the reviewed 87-block inventory")
+    all_blocks = {block.findtext("EntityId"): (grid, block)
+                  for grid in sector_root.iter("MyObjectBuilder_EntityBase")
+                  for block in grid.findall("./CubeBlocks/*") if block.findtext("EntityId")}
+    controller_blocks = [block for block in list(target_blocks)
+                         if block.findtext("EntityId") == "83468039688685570" and
+                         block.get(xsi_type) == "MyObjectBuilder_Cockpit" and
+                         block.findtext("SubtypeName") == "SmallBlockCapCockpit"]
+    camera_blocks = [block for block in list(target_blocks)
+                     if block.findtext("EntityId") == camera_id and
+                     block.get(xsi_type) == "MyObjectBuilder_CameraBlock" and
+                     block.findtext("SubtypeName") == "SmallCameraBlock"]
+    core_blocks = [block for block in list(target_blocks)
+                   if block.findtext("EntityId") == str(core.get("entity_id")) and
+                   block.get(xsi_type) == "MyObjectBuilder_UpgradeModule" and
+                   block.findtext("SubtypeName") == "VoidwrightNavigationControllerSmall"]
+    observed_suspensions = [block for block in list(target_blocks)
+                            if block.get(xsi_type) == "MyObjectBuilder_MotorSuspension"]
+    expected_wheels = {
+        "72448287472244394": "130825891980829223",
+        "102872810511526201": "127988954682183794",
+        "87663115116726466": "141480516845941196",
+        "95379321851010785": "95733545729686414",
+    }
+    observed_wheel_map = {}
+    for wheel in observed_suspensions:
+        wheel_id = wheel.findtext("EntityId")
+        top = all_blocks.get(wheel.findtext("TopBlockId"))
+        if top is not None:
+            observed_wheel_map[wheel_id] = top[0].findtext("EntityId")
+    if (len(controller_blocks) != 1 or len(camera_blocks) != 1 or len(core_blocks) != 1 or
+            observed_wheel_map != expected_wheels):
+        raise SystemExit("instrumented sector camera/controller/core or four wheel-subgrid identities differ from the pinned fixture")
+    return configured_camera_id
+
+
+def _validate_local_vehicle_direction_proof(instance_root: Path, proof: object,
+                                             current_plugin_tree_sha256: object) -> dict[str, str]:
+    """Validate the one reviewed prior steering result before binding it to a fresh run."""
+    expected = {
+        "schema": "vragecage.local-vehicle-steering-direction-proof.v1",
+        "prior_run_id": "c78991913a0d95890d19e96dbbbce14b",
+        "prior_fixture_id": "fbc96c623e74f8a5d2420a6ee155b9cf",
+        "prior_command_id": "local-dff3e8cd8a4540f7acd9bafb05a0785d",
+        "prior_log_filename": "SpaceEngineersDedicated_20261021_155545766.log",
+        "prior_log_sha256": "327fd0b7a0fa58d641e53d6fe2e9a9afa98646e2b63e11cd04c76ef888919a49",
+        "prior_receipt_file_sha256": "c2d41c3c7b681f333005bea80c4a2ba07f24411c02e231ed89dd441f1413ad03",
+        "prior_plugin_tree_sha256": "cdb6766bcd0c0ff983df3af3cbafc114def92480be046532776757b6d7153078",
+        "source_tree_sha256": "9ae4286ebb6fad94516612cfb083c347ccb197c62276d5658a49d65ede373f8f",
+        "grid_id": 105034224363529183,
+        "controller_id": 83468039688685570,
+        "requested_override": 0.05,
+        "measured_steering_angle": 0.01308997,
+        "wheel_map": [
+            {"id": 72448287472244394, "steering": True, "invert_steer": False},
+            {"id": 102872810511526201, "steering": True, "invert_steer": False},
+            {"id": 87663115116726466, "steering": False, "invert_steer": False},
+            {"id": 95379321851010785, "steering": False, "invert_steer": False},
+        ],
+    }
+    if proof != expected or not isinstance(current_plugin_tree_sha256, str) or \
+            not re.fullmatch(r"[0-9a-f]{64}", current_plugin_tree_sha256):
+        raise SystemExit("steering direction proof does not match the exact reviewed prior run")
+    run_id = expected["prior_run_id"]
+    receipt_path = instance_root / "Quarantine" / run_id / "terminal-receipt.json"
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise SystemExit("prior steering terminal receipt is unavailable or unsafe")
+    receipt_bytes = receipt_path.read_bytes()
+    if hashlib.sha256(receipt_bytes).hexdigest() != expected["prior_receipt_file_sha256"]:
+        raise SystemExit("prior steering terminal receipt hash changed")
+    try:
+        envelope = json.loads(receipt_bytes, object_pairs_hook=_json_no_duplicate_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise SystemExit(f"prior steering terminal receipt is invalid: {error}") from error
+    receipt = envelope.get("receipt") if isinstance(envelope, dict) else None
+    canonical = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if envelope.get("schema") != "vragecage.lab-terminal-receipt.v1" or \
+            envelope.get("run_id") != run_id or \
+            hashlib.sha256(canonical).hexdigest() != envelope.get("receipt_sha256") or \
+            not isinstance(receipt, dict) or receipt.get("lab_run_id") != run_id or \
+            receipt.get("clean_shutdown") is not True or \
+            receipt.get("game_log_sha256") != expected["prior_log_sha256"] or \
+            receipt.get("staged_plugin_tree_sha256") != expected["prior_plugin_tree_sha256"] or \
+            not isinstance(receipt.get("staged_plugin"), dict) or \
+            receipt["staged_plugin"].get("tree_sha256") != expected["prior_plugin_tree_sha256"]:
+        raise SystemExit("prior steering receipt does not bind the expected run, plugin, log, and clean stop")
+    log_path = instance_root / expected["prior_log_filename"]
+    if log_path.is_symlink() or not log_path.is_file() or \
+            receipt.get("game_log") != str(log_path) or \
+            hashlib.sha256(log_path.read_bytes()).hexdigest() != expected["prior_log_sha256"]:
+        raise SystemExit("prior steering game log is unavailable or its exact hash changed")
+    log = log_path.read_text(encoding="utf-8", errors="replace")
+    steering_marker = (
+        "Voidwright local test steering: run=" + run_id +
+        " fixture=" + expected["prior_fixture_id"] +
+        " grid=105034224363529183 controller=83468039688685570 command=" +
+        expected["prior_command_id"] + " requestedOverride=0.05"
+    )
+    terminal_marker = (
+        "Voidwright local test terminal: run=" + run_id +
+        " fixture=" + expected["prior_fixture_id"] +
+        " grid=105034224363529183 controller=83468039688685570 command=" +
+        expected["prior_command_id"] + " state=blocked"
+    )
+    wheel_marker = (
+        "wheelReadbacks=72448287472244394:steering=True,override=0,angle=0.01308997,propulsion=0;"
+        "102872810511526201:steering=True,override=0,angle=0.01308997,propulsion=0;"
+        "87663115116726466:steering=False,override=0,angle=0,propulsion=0;"
+        "95379321851010785:steering=False,override=0,angle=0,propulsion=0"
+    )
+    writer_marker = (
+        "writerAudit=grid=105034224363529183;programmableBlocks=0;programmableRunning=0;"
+        "movementBlocks=0;autopilotActive=0;aiBehaviorActive=0;controlledSeats=0;"
+    )
+    if steering_marker not in log or terminal_marker not in log or \
+            wheel_marker not in log or writer_marker not in log:
+        raise SystemExit("prior steering log lacks exact positive-angle, neutral-propulsion, and isolated-writer evidence")
+    stage_path = instance_root / ".vragecage-plugin-stage.json"
+    if stage_path.is_symlink() or not stage_path.is_file():
+        raise SystemExit("current staged plugin receipt is unavailable or unsafe")
+    try:
+        stage = json.loads(stage_path.read_text(encoding="utf-8"),
+                           object_pairs_hook=_json_no_duplicate_keys)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise SystemExit(f"current staged plugin receipt is invalid: {error}") from error
+    plugin_root = Path(str(stage.get("path", "")))
+    try:
+        plugin_root.resolve(strict=True).relative_to(instance_root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise SystemExit("current plugin package escaped the exact disposable clone") from error
+    if stage.get("instance") != instance_root.name or \
+            stage.get("tree_sha256") != current_plugin_tree_sha256 or \
+            _magnetar_package_tree_hash(plugin_root) != current_plugin_tree_sha256:
+        raise SystemExit("current plugin package hash does not match the proof-bound configuration")
+    return {"log_sha256": expected["prior_log_sha256"],
+            "receipt_sha256": expected["prior_receipt_file_sha256"],
+            "plugin_tree_sha256": current_plugin_tree_sha256}
+
+
+def _verify_magnetar_local_registration(instance: Path, world: Path,
+                                         staged_mod: dict[str, object]) -> int:
+    mod_id = staged_mod.get("synthetic_workshop_id")
+    mod_name = staged_mod.get("name")
+    if (not isinstance(mod_id, int) or isinstance(mod_id, bool) or
+            not 90_000_000_000_000_000 <= mod_id < 90_100_000_000_000_000 or
+            not isinstance(mod_name, str) or not mod_name or
+            staged_mod.get("load_world") != str(world)):
+        raise SystemExit("Magnetar local registration receipt does not identify the configured LoadWorld")
+    worker = worker_root().resolve(strict=True)
+    cache = worker / "magnetar-steam/steamapps/workshop/content/244850" / str(mod_id)
+    staged_path = Path(str(staged_mod.get("path", "")))
+    if (staged_path != cache or staged_path.is_symlink() or not staged_path.is_dir() or
+            _magnetar_package_tree_hash(cache) != staged_mod.get("tree_sha256")):
+        raise SystemExit("Magnetar cached package differs from its registration receipt")
+    sources = instance / "MagnetarConfig/Sources/sources.xml"
+    profile = instance / "MagnetarConfig/Profiles/Current.xml"
+    for path, field in ((sources, "sources_sha256"), (profile, "profile_sha256")):
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f"Magnetar local registration is missing: {path.name}")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != staged_mod.get(field):
+            raise SystemExit(f"Magnetar local registration differs from its receipt: {path.name}")
+    try:
+        source_root = ET.parse(sources).getroot()
+        profile_root = ET.parse(profile).getroot()
+    except ET.ParseError as error:
+        raise SystemExit(f"Magnetar Sources or Current profile is invalid XML: {error}") from error
+    matches = [item for item in source_root.findall("./ModSources/Mod")
+               if item.findtext("Name") == mod_name or item.findtext("ID") == str(mod_id)]
+    if (len(matches) != 1 or matches[0].findtext("Name") != mod_name or
+            matches[0].findtext("ID") != str(mod_id) or
+            matches[0].findtext("Enabled", "true").lower() != "true"):
+        raise SystemExit("Magnetar Sources does not enable this local mod exactly once")
+    selected = [item.text for item in profile_root.findall("./Mods/unsignedLong")]
+    if selected.count(str(mod_id)) != 1:
+        raise SystemExit("Magnetar Current profile does not select this local mod exactly once")
+    for filename in ("Sandbox.sbc", "Sandbox_config.sbc"):
+        raw = (world / filename).read_bytes()
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as error:
+            raise SystemExit(f"configured checkpoint is invalid XML: {filename}: {error}") from error
+        if b"xsd:" in raw and b"xmlns:xsd=" not in raw:
+            raise SystemExit(f"configured checkpoint lost its xsd QName namespace: {filename}")
+        mods = root.find("Mods")
+        if mods is None:
+            raise SystemExit(f"configured checkpoint has no Mods element: {filename}")
+        duplicates = [item for item in mods.findall("ModItem")
+                      if (item.findtext("PublishedFileId") or "0").strip() == str(mod_id) or
+                      ((item.findtext("Name") or "").strip() == mod_name and
+                       (item.findtext("PublishedFileId") or "0").strip() in ("", "0"))]
+        if duplicates:
+            raise SystemExit(f"local Magnetar package is still listed as a Workshop dependency in {filename}")
+    return mod_id
+
+
+def verify_block_lifecycle_prelaunch(instance: Path, active: dict[str, object]) -> None:
+    """Fail closed before server start when a staged lifecycle diagnostic is incomplete."""
+    candidates = list(instance.rglob("vragecage-block-lifecycle-target-v1.json"))
+    if not candidates:
+        return
+    if len(candidates) != 1 or candidates[0].is_symlink():
+        raise SystemExit("lifecycle target must exist once as a regular file in the game API storage namespace")
+    config = ET.parse(instance / "SpaceEngineers-Dedicated.cfg").getroot()
+    load_world = config.findtext("LoadWorld")
+    if not load_world:
+        raise SystemExit("lifecycle preflight requires the configured LoadWorld")
+    world = Path(load_world)
+    if not world.is_absolute():
+        world = instance / world
+    world = world.resolve(strict=True)
+    try:
+        world.relative_to(instance.resolve(strict=True))
+    except ValueError as error:
+        raise SystemExit("lifecycle LoadWorld escaped the selected instance") from error
+    config_root = ET.parse(instance / "SpaceEngineers-Dedicated.cfg").getroot()
+    server_ip = config_root.findtext("IP")
+    remote_api = config_root.findtext("RemoteApiEnabled")
+    try:
+        address = ipaddress.ip_address(server_ip or "")
+        server_port = int(config_root.findtext("ServerPort") or "")
+        steam_port = int(config_root.findtext("SteamPort") or "")
+    except ValueError as error:
+        raise SystemExit("lifecycle preflight requires a valid server bind and ports") from error
+    if (not isinstance(address, ipaddress.IPv4Address) or not address.is_private or
+            address.is_loopback or address.is_unspecified or
+            remote_api is None or remote_api.strip().lower() != "false" or
+            not (1024 <= server_port <= 65535 and 1024 <= steam_port <= 65535) or
+            server_port == steam_port):
+        raise SystemExit("lifecycle preflight requires a private bind, distinct ports, and disabled Remote API")
+    for port in (server_port, steam_port):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind((str(address), port))
+        except OSError as error:
+            raise SystemExit(f"lifecycle preflight bind port {port} is unavailable") from error
+        finally:
+            probe.close()
+    if (active.get("bootstrap_mode") != "discovery-only" or active.get("command") is not None or
+            (instance / ".vragecage-pending-command.json").exists()):
+        raise SystemExit("lifecycle preflight requires discovery-only mode with no pending or active command")
+    session_name = ET.parse(world / "Sandbox.sbc").getroot().findtext("SessionName")
+    mod_receipt_path = instance / ".vragecage-mod-stage.json"
+    if mod_receipt_path.is_symlink() or not mod_receipt_path.is_file():
+        raise SystemExit("lifecycle preflight requires a safe staged-mod receipt")
+    staged_mod = json.loads(mod_receipt_path.read_text(encoding="utf-8"))
+    mod_id = _verify_magnetar_local_registration(instance, world, staged_mod)
+    if (not isinstance(session_name, str) or not session_name or
+            not isinstance(mod_id, int) or isinstance(mod_id, bool) or mod_id <= 0):
+        raise SystemExit("lifecycle preflight has an invalid session or mod identity")
+    api_storage = instance / "Saves" / session_name / "Storage"
+    host_storage = api_storage / "VRage.Game"
+    mod_storage = api_storage / f"{mod_id}.sbm_Voidwright"
+    expected_target = mod_storage / "vragecage-block-lifecycle-target-v1.json"
+    if candidates[0].resolve(strict=True) != expected_target.resolve(strict=True):
+        raise SystemExit("lifecycle target is not staged in the Space Engineers API WorldStorage namespace")
+    if (instance / ".vragecage-pending-command.json").exists():
+        raise SystemExit("lifecycle discovery-only preflight refuses a pending actuator command")
+    expected_bootstrap = {
+        "schema": "vragecage.lab-bootstrap.v1",
+        "runId": active.get("run_id", ""),
+        "fixtureId": active.get("fixture_id", ""),
+        "bootstrapNonce": active.get("bootstrap_nonce", ""),
+        "baselineDiscoveryRunId": active.get("baseline_discovery_run_id", ""),
+    }
+    for bootstrap_path in (host_storage / "vragecage-lab-bootstrap-v1.json",
+                           mod_storage / "vragecage-lab-bootstrap-v1.json"):
+        if bootstrap_path.is_symlink() or not bootstrap_path.is_file():
+            raise SystemExit("lifecycle run bootstrap is missing from an API WorldStorage scope")
+        if json.loads(bootstrap_path.read_text(encoding="utf-8")) != expected_bootstrap:
+            raise SystemExit("lifecycle bootstrap run, fixture, or nonce binding does not match this run")
+    ledger_path = instance / ".vragecage-diagnostic-instrumentation.json"
+    sector_path = world / "SANDBOX_0_0_0_.sbs"
+    manifest = json.loads(expected_target.read_text(encoding="utf-8"))
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    lab = json.loads((instance / ".vragecage-lab.json").read_text(encoding="utf-8"))
+    imported = json.loads((instance / ".vragecage-world-import.json").read_text(encoding="utf-8"))
+    source_hash = ledger.get("source_tree_sha256")
+    if (manifest.get("schema") != "vragecage.block-lifecycle-target.v1" or
+            manifest.get("loadWorld") != str(world) or
+            manifest.get("sourceTreeSha256") != source_hash or
+            manifest.get("instrumentationLedgerSha256") != hashlib.sha256(ledger_path.read_bytes()).hexdigest() or
+            ledger.get("fixture_id") != active.get("fixture_id") or
+            source_hash != lab.get("source_tree_sha256") or source_hash != imported.get("tree_sha256") or
+            source_hash != "9ae4286ebb6fad94516612cfb083c347ccb197c62276d5658a49d65ede373f8f" or
+            hashlib.sha256(sector_path.read_bytes()).hexdigest() != ledger.get("sector_after_sha256")):
+        raise SystemExit("lifecycle manifest, ledger, fixture, source, or sector hashes do not agree")
+    root = ET.parse(sector_path).getroot()
+    grids = [entity for entity in root.iter("MyObjectBuilder_EntityBase")
+             if entity.findtext("EntityId") == manifest.get("targetGridEntityId")]
+    if len(grids) != 1 or grids[0].findtext("DisplayName") != "Blue Truck":
+        raise SystemExit("lifecycle preflight could not resolve the exact instrumented Blue Truck")
+    cube_blocks = grids[0].find("CubeBlocks")
+    if cube_blocks is None or len(list(cube_blocks)) != 87:
+        raise SystemExit("lifecycle preflight requires the exact 87-block instrumented fixture")
+    expected_blocks = {
+        manifest.get("controllerEntityId"): (manifest.get("controllerType"), manifest.get("controllerSubtype")),
+        manifest.get("coreEntityId"): ("MyObjectBuilder_UpgradeModule", manifest.get("coreSubtype")),
+        manifest.get("cameraEntityId"): ("MyObjectBuilder_CameraBlock", manifest.get("cameraSubtype")),
+    }
+    observed = {}
+    for block in list(cube_blocks):
+        entity_id = block.findtext("EntityId")
+        if entity_id in expected_blocks:
+            observed[entity_id] = (block.get("{http://www.w3.org/2001/XMLSchema-instance}type"),
+                                   block.findtext("SubtypeName"))
+        if block.get("{http://www.w3.org/2001/XMLSchema-instance}type") == "MyObjectBuilder_MotorSuspension":
+            for field in ("PropulsionOverride", "SteeringOverride"):
+                value = block.findtext(field)
+                if value is not None and (not math.isfinite(float(value)) or abs(float(value)) > 1e-7):
+                    raise SystemExit("lifecycle preflight found a non-neutral wheel override in the saved fixture")
+    if observed != expected_blocks:
+        raise SystemExit("lifecycle controller, Core, or camera identity differs from its pinned manifest")
+    added = ledger.get("added_blocks")
+    controller = ledger.get("controller")
+    if (not isinstance(added, list) or len(added) != 2 or not isinstance(controller, dict) or
+            manifest.get("controllerEntityId") != controller.get("entity_id") or
+            manifest.get("coreEntityId") != next((block.get("entity_id") for block in added
+                                                     if block.get("subtype") == manifest.get("coreSubtype")), None) or
+            manifest.get("cameraEntityId") != next((block.get("entity_id") for block in added
+                                                       if block.get("subtype") == manifest.get("cameraSubtype")), None)):
+        raise SystemExit("lifecycle target identities do not match the instrumentation ledger")
+    suspension_ids = sorted(block.findtext("EntityId") for block in list(cube_blocks)
+                            if block.get("{http://www.w3.org/2001/XMLSchema-instance}type") ==
+                            "MyObjectBuilder_MotorSuspension")
+    expected_suspensions = sorted(str(value) for value in ledger.get("existing_suspension_ids", []))
+    if not suspension_ids or suspension_ids != expected_suspensions:
+        raise SystemExit("lifecycle preflight wheel inventory differs from its instrumentation ledger")
+    for filename in ("voidwright-lab-activation-v1.txt", f"voidwright-activation-{active.get('run_id', '')}.txt"):
+        if (host_storage / filename).exists():
+            raise SystemExit("discovery-only lifecycle preflight found an actuator activation artifact")
+
+
 def command_run(args: argparse.Namespace) -> int:
     root = worker_root()
     config = root / "instances" / args.instance / "SpaceEngineers-Dedicated.cfg"
@@ -229,41 +1116,410 @@ def command_run(args: argparse.Namespace) -> int:
         emit({"schema": "vragecage.operation.v1", "operation": "run", "instance": args.instance, "status": "already_running", "unit": unit})
         return 0
     engine = instance_engine(args.instance)
+    if args.instance == "land-local-test-hydro-scout-20261022-b":
+        raise SystemExit("Hydro Scout candidate b is retired after its invalid WorldId load failure; preserve its run evidence")
+    if args.instance == "land-local-test-hydro-scout-20261022-c":
+        local_test_path = root / "instances" / args.instance / ".vragecage-local-vehicle-test.json"
+        if local_test_path.is_symlink() or not local_test_path.is_file():
+            raise SystemExit("Hydro Scout LocalVehicleTest cannot start without its exact config and staged package receipts")
+        verifier = root / "instances" / args.instance / ".hydro_scout_local_vehicle_test_packages.py"
+        if not verifier.is_file() or verifier.is_symlink():
+            raise SystemExit("Hydro Scout LocalVehicleTest package verifier is missing or unsafe")
+        if run_checked([sys.executable, str(verifier), str(root / "instances" / args.instance), str(root)]) != 0:
+            raise SystemExit("Hydro Scout LocalVehicleTest package/config receipts failed verification")
+    local_test_runtime_deadline_seconds = None
     env_args = [
         f"VRAGECAGE_WORKER_ROOT={root}",
         "VRAGECAGE_ALLOW_NON_LOOPBACK=1",
     ]
+    local_test_config = root / "instances" / args.instance / ".vragecage-local-vehicle-test.json"
+    if local_test_config.exists() or local_test_config.is_symlink():
+        if local_test_config.is_symlink() or not stat.S_ISREG(local_test_config.lstat().st_mode):
+            raise SystemExit("local vehicle test config must be a regular non-symlink file")
+        try:
+            local_test = json.loads(local_test_config.read_text(encoding="utf-8"),
+                                    object_pairs_hook=_json_no_duplicate_keys)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            raise SystemExit(f"invalid local vehicle test config: {error}") from error
+        lab_path = root / "instances" / args.instance / ".vragecage-lab.json"
+        import_path = root / "instances" / args.instance / ".vragecage-world-import.json"
+        try:
+            if (lab_path.is_symlink() or not stat.S_ISREG(lab_path.lstat().st_mode) or
+                    import_path.is_symlink() or not stat.S_ISREG(import_path.lstat().st_mode)):
+                raise OSError("lab and import receipts must be regular non-symlink files")
+            lab = json.loads(lab_path.read_text(encoding="utf-8"), object_pairs_hook=_json_no_duplicate_keys)
+            imported = json.loads(import_path.read_text(encoding="utf-8"), object_pairs_hook=_json_no_duplicate_keys)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            raise SystemExit("local vehicle test config requires valid disposable lab/import receipts") from error
+        # Admit only exact disposable bindings in the LocalVehicleTest lane.
+        # Brake-only authorization cannot dispatch propulsion or movement;
+        # bounded movement still requires separate clearance and writer proof.
+        local_test_bindings = {
+            "land-local-test-hydro-scout-20261022-c": {
+                "source_tree_sha256": "33400d8eb2a43e555856a3d48c035a784c6fa8f5453d524782372c28df9eeff4",
+                "modes": {"read-only-baseline"},
+                "grid_id": 113504086011869676,
+                "controller_id": 112711005364517351,
+                "camera_id": 6902088205773520808,
+                "wheel_ids": [135633742662929758, 92672912164488213,
+                              129575574301717563, 72699375256551291],
+                "wheel_grid_ids": [83781654658335329, 101822873690952882,
+                                   90663942980601709, 143998760294003094],
+            },
+            "land-local-test-v4r1-blue-20261022-a": {
+                "source_tree_sha256": "7377fa735e431f7108e57735ff79a3f33aee662ee208e670ee79800d1585fa8c",
+                "modes": {"read-only-baseline", "stationary-brake-only"},
+                "grid_id": 105034224363529183,
+                "controller_id": 83468039688685570,
+                "camera_id": 91077977706459680,
+                "wheel_ids": [72448287472244394, 102872810511526201,
+                              87663115116726466, 95379321851010785],
+                "wheel_grid_ids": [130825891980829223, 127988954682183794,
+                                   141480516845941196, 95733545729686414],
+            },
+        }
+        binding = local_test_bindings.get(args.instance)
+        common = {
+            "schema": "vragecage.local-vehicle-test.v1",
+            "instance": args.instance,
+            "grid_id": binding["grid_id"] if binding else None,
+            "controller_id": binding["controller_id"] if binding else None,
+            "source_tree_sha256": binding["source_tree_sha256"] if binding else None,
+        }
+        station = {**common, "mode": "stationary-steering-only", "propulsion_enabled": False,
+                   "isolated_clear": False}
+        brake_only = {**common, "mode": "stationary-brake-only", "propulsion_enabled": False,
+                      "isolated_clear": False, "max_speed_meters_per_second": 0.2,
+                      "max_displacement_meters": 6.0, "command_timeout_seconds": 5,
+                      "host_watchdog_seconds": 60}
+        bounded = {**common, "mode": "isolated-clear", "propulsion_enabled": True,
+                   "isolated_clear": True, "max_speed_meters_per_second": 0.2,
+                   "max_displacement_meters": 6.0, "command_timeout_seconds": 5,
+                   "host_watchdog_seconds": 60}
+        read_only = {**common, "mode": "read-only-baseline", "propulsion_enabled": False,
+                     "isolated_clear": False, "max_speed_meters_per_second": 0.2,
+                     "max_displacement_meters": 6.0, "command_timeout_seconds": 5,
+                     "host_watchdog_seconds": 60}
+        expected_wheel_ids = binding["wheel_ids"] if binding else []
+        expected_wheel_grid_ids = binding["wheel_grid_ids"] if binding else []
+        brake_only.update({"camera_id": binding["camera_id"] if binding else None,
+                           "wheel_ids": expected_wheel_ids,
+                           "wheel_grid_ids": expected_wheel_grid_ids})
+        common_matches = all(
+            type(local_test.get(key)) is type(value) and local_test.get(key) == value
+            for key, value in common.items()
+        )
+        direction_proof = local_test.pop("steering_direction_proof", None)
+        current_plugin_tree_sha256 = local_test.pop("current_plugin_tree_sha256", None)
+        is_station_mode = (
+            binding is not None and "stationary-steering-only" in binding["modes"] and
+            set(local_test) == set(station) and
+            common_matches and
+            local_test.get("mode") == station["mode"] and
+            local_test.get("propulsion_enabled") is False and
+            local_test.get("isolated_clear") is False and
+            type(local_test.get("propulsion_enabled")) is bool and
+            type(local_test.get("isolated_clear")) is bool
+        )
+        brake_only_keys = set(brake_only)
+        is_brake_only_mode = (
+            binding is not None and "stationary-brake-only" in binding["modes"] and
+            set(local_test) == brake_only_keys and common_matches and
+            local_test.get("mode") == "stationary-brake-only" and
+            local_test.get("propulsion_enabled") is False and
+            local_test.get("isolated_clear") is False and
+            type(local_test.get("propulsion_enabled")) is bool and
+            type(local_test.get("isolated_clear")) is bool and
+            type(local_test.get("max_speed_meters_per_second")) in (int, float) and
+            0 < local_test["max_speed_meters_per_second"] <= brake_only["max_speed_meters_per_second"] and
+            type(local_test.get("max_displacement_meters")) in (int, float) and
+            0 < local_test["max_displacement_meters"] <= brake_only["max_displacement_meters"] and
+            type(local_test.get("command_timeout_seconds")) is int and
+            1 <= local_test["command_timeout_seconds"] <= brake_only["command_timeout_seconds"] and
+            type(local_test.get("host_watchdog_seconds")) is int and
+            local_test.get("host_watchdog_seconds") == brake_only["host_watchdog_seconds"] and
+            type(local_test.get("camera_id")) is int and
+            local_test.get("camera_id") == binding["camera_id"] and
+            local_test.get("wheel_ids") == expected_wheel_ids and
+            local_test.get("wheel_grid_ids") == expected_wheel_grid_ids and
+            all(type(value) is int for value in local_test["wheel_ids"] + local_test["wheel_grid_ids"])
+        )
+        bounded_keys = set(bounded)
+        is_bounded_mode = (
+            binding is not None and "isolated-clear" in binding["modes"] and
+            set(local_test) == bounded_keys | {"camera_id", "wheel_ids", "wheel_grid_ids"} and
+            common_matches and
+            local_test.get("mode") == "isolated-clear" and
+            local_test.get("propulsion_enabled") is True and
+            local_test.get("isolated_clear") is True and
+            type(local_test.get("max_speed_meters_per_second")) in (int, float) and
+            math.isfinite(local_test["max_speed_meters_per_second"]) and
+            0 < local_test["max_speed_meters_per_second"] <= bounded["max_speed_meters_per_second"] and
+            type(local_test.get("max_displacement_meters")) in (int, float) and
+            math.isfinite(local_test["max_displacement_meters"]) and
+            0 < local_test["max_displacement_meters"] <= bounded["max_displacement_meters"] and
+            type(local_test.get("command_timeout_seconds")) is int and
+            1 <= local_test["command_timeout_seconds"] <= bounded["command_timeout_seconds"] and
+            type(local_test.get("host_watchdog_seconds")) is int and
+            local_test.get("host_watchdog_seconds") == bounded["host_watchdog_seconds"] and
+            type(local_test.get("camera_id")) is int and local_test["camera_id"] > 0 and
+            isinstance(local_test.get("wheel_ids"), list) and
+            all(type(value) is int for value in local_test["wheel_ids"]) and
+            local_test["wheel_ids"] == expected_wheel_ids and
+            isinstance(local_test.get("wheel_grid_ids"), list) and
+            all(type(value) is int for value in local_test["wheel_grid_ids"]) and
+            local_test["wheel_grid_ids"] == expected_wheel_grid_ids
+        )
+        is_read_only_baseline_mode = (
+            binding is not None and "read-only-baseline" in binding["modes"] and
+            set(local_test) == set(read_only) | {"camera_id", "wheel_ids", "wheel_grid_ids"} and
+            common_matches and
+            local_test.get("mode") == "read-only-baseline" and
+            local_test.get("propulsion_enabled") is False and
+            local_test.get("isolated_clear") is False and
+            type(local_test.get("propulsion_enabled")) is bool and
+            type(local_test.get("isolated_clear")) is bool and
+            type(local_test.get("max_speed_meters_per_second")) in (int, float) and
+            math.isfinite(local_test["max_speed_meters_per_second"]) and
+            0 < local_test["max_speed_meters_per_second"] <= read_only["max_speed_meters_per_second"] and
+            type(local_test.get("max_displacement_meters")) in (int, float) and
+            math.isfinite(local_test["max_displacement_meters"]) and
+            0 < local_test["max_displacement_meters"] <= read_only["max_displacement_meters"] and
+            type(local_test.get("command_timeout_seconds")) is int and
+            1 <= local_test["command_timeout_seconds"] <= read_only["command_timeout_seconds"] and
+            type(local_test.get("host_watchdog_seconds")) is int and
+            local_test.get("host_watchdog_seconds") == read_only["host_watchdog_seconds"] and
+            type(local_test.get("camera_id")) is int and
+            local_test["camera_id"] == binding["camera_id"] and
+            local_test.get("wheel_ids") == expected_wheel_ids and
+            local_test.get("wheel_grid_ids") == expected_wheel_grid_ids and
+            all(type(value) is int for value in local_test["wheel_ids"] + local_test["wheel_grid_ids"])
+        )
+        if (binding is None or local_test.get("instance") != args.instance or
+                not (is_station_mode or is_brake_only_mode or is_bounded_mode or is_read_only_baseline_mode) or
+                lab.get("schema") != "vragecage.lab-authority.v1" or
+                lab.get("authority") != "destructive-lab" or lab.get("disposable") is not True or
+                lab.get("engine") != "magnetar" or lab.get("instance") != args.instance or
+                lab.get("source_tree_sha256") != common["source_tree_sha256"] or
+                imported.get("schema") != "vragecage.world-import.v1" or
+                imported.get("instance") != args.instance or imported.get("engine") != "magnetar" or
+                imported.get("tree_sha256") != common["source_tree_sha256"]):
+            raise SystemExit("local vehicle test config does not match the exact disposable clone and bounded policy")
+        bounded_mode = is_bounded_mode
+        read_only_baseline_mode = is_read_only_baseline_mode
+        brake_only_mode = is_brake_only_mode
+        local_test_camera_id = None
+        if bounded_mode or read_only_baseline_mode:
+            local_test_camera_id = _validate_local_vehicle_test_instrumentation(
+                root / "instances" / args.instance, args.instance,
+                common["source_tree_sha256"], local_test["camera_id"])
+        elif brake_only_mode:
+            local_test_camera_id = local_test["camera_id"]
+        # This is a host-side lifetime cap on the exact disposable local-test
+        # service. It is deliberately separate from the game-side command TTL.
+        local_test_runtime_deadline_seconds = (
+            local_test["host_watchdog_seconds"] if bounded_mode else 60
+        )
+        direction_proof_metadata = None
+        if bounded_mode and direction_proof is not None:
+            direction_proof_metadata = _validate_local_vehicle_direction_proof(
+                root / "instances" / args.instance, direction_proof, current_plugin_tree_sha256)
+        elif direction_proof is not None or current_plugin_tree_sha256 is not None:
+            raise SystemExit("steering direction proof metadata must be supplied and verified together")
+        env_args.extend([
+            "VRAGECAGE_LOCAL_VEHICLE_TEST=1",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_INSTANCE={args.instance}",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_READ_ONLY_BASELINE={str(read_only_baseline_mode).lower()}",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_ISOLATED_CLEAR={str(bounded_mode).lower()}",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_STEERING_ONLY={str(not bounded_mode).lower()}",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_BRAKE_ONLY={str(brake_only_mode).lower()}",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_GRID_ID={common['grid_id']}",
+            f"VRAGECAGE_LOCAL_VEHICLE_TEST_CONTROLLER_ID={common['controller_id']}",
+            "VRAGECAGE_LOCAL_VEHICLE_TEST_MAX_DISPLACEMENT_METERS=" + str(local_test["max_displacement_meters"]),
+            "VRAGECAGE_LOCAL_VEHICLE_TEST_MAX_SPEED_METERS_PER_SECOND=" + str(local_test["max_speed_meters_per_second"]),
+            "VRAGECAGE_LOCAL_VEHICLE_TEST_AUTH_TIMEOUT_SECONDS=60",
+        ])
+        if local_test_camera_id is not None:
+            env_args.extend([
+                f"VRAGECAGE_LOCAL_VEHICLE_TEST_CAMERA_ID={local_test_camera_id}",
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_WHEEL_IDS=" + ",".join(str(value) for value in expected_wheel_ids),
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_WHEEL_GRID_IDS=" + ",".join(str(value) for value in expected_wheel_grid_ids),
+            ])
+        if direction_proof_metadata is not None:
+            env_args.extend([
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_DIRECTION_CONFIRMED=true",
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_DIRECTION_PROOF_LOG_SHA256=" + direction_proof_metadata["log_sha256"],
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_DIRECTION_PROOF_RECEIPT_SHA256=" + direction_proof_metadata["receipt_sha256"],
+                "VRAGECAGE_LOCAL_VEHICLE_TEST_DIRECTION_PROOF_PLUGIN_TREE_SHA256=" + direction_proof_metadata["plugin_tree_sha256"],
+            ])
+    telemetry_interval = getattr(args, "motion_telemetry_interval_ticks", None)
+    if telemetry_interval is not None:
+        env_args.append(f"VRAGECAGE_LAB_MOTION_TELEMETRY_INTERVAL_TICKS={telemetry_interval}")
     lab_contract = root / "instances" / args.instance / ".vragecage-lab.json"
+    expected_operation = getattr(args, "expected_operation_id", None)
+    if expected_operation is not None and not lab_contract.is_file():
+        raise SystemExit("reviewed operation pins require a destructive-lab instance")
     if lab_contract.is_file():
+        activation_args = [script("lab-contract.py"), "activate", str(root / "instances" / args.instance)]
+        discovery_only = bool(getattr(args, "discovery_only", False))
+        if discovery_only:
+            activation_args.append("--discovery-only")
+        if expected_operation is not None:
+            activation_args.extend(["--expected-operation-id", expected_operation,
+                                    "--expected-command-sha256", args.expected_command_sha256])
         activation = subprocess.run(
-            [script("lab-contract.py"), "activate", str(root / "instances" / args.instance)],
+            activation_args,
             text=True, capture_output=True,
         )
         if activation.returncode != 0:
             raise SystemExit(activation.stderr.strip() or "lab authority activation failed")
         active = json.loads(activation.stdout)
+        if args.instance in ("land-local-test-hydro-scout-20261022-c", "land-local-test-v4r1-blue-20261022-a"):
+            # Bind the narrow LocalVehicleTest authorization to the freshly minted
+            # discovery-only run before systemd starts. Movement always remains denied.
+            if (not discovery_only or active.get("bootstrap_mode") != "discovery-only"
+                    or active.get("command") is not None
+                    or active.get("instance") != args.instance
+                    or not re.fullmatch(r"[0-9a-f]{32}", str(active.get("run_id", "")))):
+                raise SystemExit("LocalVehicleTest authorization requires a fresh command-free discovery-only run")
+            q_config = root / "instances" / args.instance / ".vragecage-local-vehicle-test.json"
+            brake_only_authorization = (
+                args.instance == "land-local-test-v4r1-blue-20261022-a" and
+                local_test_config.is_file() and
+                json.loads(local_test_config.read_text(encoding="utf-8")).get("mode") == "stationary-brake-only"
+            )
+            authorization = {
+                "schema": "vragecage.local-vehicle-test-authorization.v1",
+                "instance": args.instance,
+                "fixture_id": active["fixture_id"],
+                "run_id": active["run_id"],
+                "authorized_at": datetime.now().astimezone().isoformat(),
+                "scope": "stationary-brake-only" if brake_only_authorization else "read-only-baseline",
+                "actuator_commands": brake_only_authorization,
+                "movement_authorized": False,
+                "config_sha256": hashlib.sha256(q_config.read_bytes()).hexdigest(),
+                "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "authorization_basis": (
+                    "explicit authorization for a propulsion-disabled stationary brake-only LocalVehicleTest preflight"
+                    if brake_only_authorization else
+                    "explicit authorization for the read-only LocalVehicleTest baseline, relayed by Corvi"
+                ),
+            }
+            authorization_path = Path(str(active["quarantine"])) / "authorization-receipt.json"
+            authorization_bytes = (json.dumps(authorization, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            try:
+                with authorization_path.open("xb") as stream:
+                    os.chmod(authorization_path, 0o600)
+                    stream.write(authorization_bytes)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError as error:
+                raise SystemExit(f"q run authorization receipt could not be recorded; refusing launch: {error}") from error
+        write_lab_bootstrap(root / "instances" / args.instance, active)
+        if discovery_only:
+            verify_block_lifecycle_prelaunch(root / "instances" / args.instance, active)
+        preflight_challenge = secrets.token_hex(16)
+        preflight_context = active.get("preflight_context")
+        if not discovery_only and (not isinstance(preflight_context, dict)
+                or not isinstance(preflight_context.get("path"), str)
+                or not isinstance(preflight_context.get("sha256"), str)
+                or not isinstance(preflight_context.get("fixture_id"), str)):
+            raise SystemExit("lab activation did not return a verified movement preflight context")
         env_args.extend([
             "VRAGECAGE_LAB_AUTHORITY=destructive-lab",
             f"VRAGECAGE_LAB_RUN_ID={active['run_id']}",
             f"VRAGECAGE_LAB_MANIFEST={lab_contract}",
             f"VRAGECAGE_QUARANTINE={active['quarantine']}",
+            f"VRAGECAGE_LAB_PREFLIGHT_CHALLENGE={preflight_challenge}",
         ])
+        if discovery_only:
+            env_args.extend([
+                "VRAGECAGE_LAB_COMMAND=discovery-only",
+                f"VRAGECAGE_LAB_DISCOVERY_NONCE={active['bootstrap_nonce']}",
+                f"VRAGECAGE_LAB_DISCOVERY_BASELINE_RUN_ID={active['baseline_discovery_run_id']}",
+                f"VRAGECAGE_LAB_FIXTURE_ID={active['fixture_id']}",
+            ])
+        else:
+            env_args.extend([
+                f"VRAGECAGE_LAB_PREFLIGHT_CONTEXT={preflight_context['path']}",
+                f"VRAGECAGE_LAB_PREFLIGHT_CONTEXT_SHA256={preflight_context['sha256']}",
+                f"VRAGECAGE_LAB_FIXTURE_ID={preflight_context['fixture_id']}",
+            ])
         command_spec = active.get("command")
         if isinstance(command_spec, dict):
+            if command_spec.get("action") == "direct-maneuver":
+                env_args.append("VRAGECAGE_LAB_MOTION_OWNER=voidwright-plugin")
+            elif command_spec.get("action") in ("drive-to-coordinate-depth", "preflight-only"):
+                env_args.append("VRAGECAGE_LAB_MOTION_OWNER=voidwright-mod")
             env_args.extend([
                 f"VRAGECAGE_LAB_COMMAND={command_spec.get('action', '')}",
                 f"VRAGECAGE_LAB_OPERATION_ID={command_spec.get('operation_id', '')}",
                 f"VRAGECAGE_LAB_CONTROLLER_ID={command_spec.get('controller_id', '')}",
                 f"VRAGECAGE_LAB_DISTANCE={command_spec.get('distance_meters', '')}",
+                f"VRAGECAGE_LAB_REVERSE={str(bool(command_spec.get('reverse', False))).lower()}",
                 f"VRAGECAGE_LAB_MAX_SPEED={command_spec.get('max_speed', '')}",
                 f"VRAGECAGE_LAB_TIMEOUT_TICKS={command_spec.get('timeout_ticks', '')}",
+                f"VRAGECAGE_LAB_ARRIVAL_RADIUS={command_spec.get('arrival_radius', '')}",
+                f"VRAGECAGE_LAB_START_DELAY_TICKS={command_spec.get('start_delay_ticks', 0)}",
+                f"VRAGECAGE_LAB_REVERSE={str(bool(command_spec.get('reverse', False))).lower()}",
+                f"VRAGECAGE_LAB_CAMERA_ID={command_spec.get('camera_id', '')}",
+                f"VRAGECAGE_LAB_STATOR_ID={command_spec.get('stator_id', '')}",
+                f"VRAGECAGE_LAB_STATOR_CAMERA_ID={command_spec.get('camera_id', '')}",
+                f"VRAGECAGE_LAB_STATOR_EXPECTED_NAME={command_spec.get('expected_name', '')}",
+                f"VRAGECAGE_LAB_STATOR_ANGLE_DEGREES={command_spec.get('desired_angle_degrees', '')}",
+                f"VRAGECAGE_LAB_STATOR_MAX_RPM={command_spec.get('max_rpm', '')}",
+                f"VRAGECAGE_LAB_RECORDER_ID={command_spec.get('recorder_id', '')}",
+                f"VRAGECAGE_LAB_DURATION_TICKS={command_spec.get('duration_ticks', '')}",
+                f"VRAGECAGE_LAB_FRAME_WIDTH={command_spec.get('width', '')}",
+                f"VRAGECAGE_LAB_FRAME_HEIGHT={command_spec.get('height', '')}",
+                f"VRAGECAGE_LAB_FRAME_RANGE={command_spec.get('range_meters', '')}",
+                f"VRAGECAGE_LAB_FRAME_FOV={command_spec.get('fov_degrees', '')}",
+                f"VRAGECAGE_LAB_ZONE={command_spec.get('zone', '')}",
+                f"VRAGECAGE_LAB_TARGET_X={(command_spec.get('target') or ['', '', ''])[0]}",
+                f"VRAGECAGE_LAB_TARGET_Y={(command_spec.get('target') or ['', '', ''])[1]}",
+                f"VRAGECAGE_LAB_TARGET_Z={(command_spec.get('target') or ['', '', ''])[2]}",
+                f"VRAGECAGE_LAB_ARRIVAL_RADIUS={command_spec.get('arrival_radius', '')}",
+                f"VRAGECAGE_LAB_TARGET_OFFSET_LEFT={command_spec.get('target_offset_left_m', 0)}",
+                f"VRAGECAGE_LAB_DEPTH_CAMERA_ID={command_spec.get('depth_camera_id', '')}",
+                f"VRAGECAGE_LAB_AGENT_CORE_ID={preflight_context.get('agent_core_id', '')}",
+                f"VRAGECAGE_LAB_AGENT_DISCOVERY_RUN_ID={preflight_context.get('discovery_run_id', '')}",
+                f"VRAGECAGE_LAB_AGENT_DISCOVERY_TICK={preflight_context.get('discovery_tick', '')}",
+                f"VRAGECAGE_LAB_AGENT_DISCOVERY_FINGERPRINT={preflight_context.get('discovery_fingerprint', '')}",
+                f"VRAGECAGE_LAB_START_DELAY_TICKS={command_spec.get('start_delay_ticks', 0)}",
             ])
+            if command_spec.get("action") in ("direct-maneuver", "preflight-only"):
+                segments = command_spec.get("segments") or []
+                compact = ";".join(
+                    ",".join((
+                        {"forward-distance": "F", "reverse-distance": "R", "steer-to-heading": "H",
+                         "steer-angle": "A", "stop": "S", "stationary-hold": "W"}[segment["kind"]],
+                        format(float(segment["value"]), ".17g"),
+                        format(float(segment["max_speed"]), ".17g"),
+                        str(int(segment["timeout_ticks"])),
+                    )) for segment in segments
+                )
+                env_args.extend([
+                    f"VRAGECAGE_LAB_GRID_ID={command_spec.get('grid_id', '')}",
+                    f"VRAGECAGE_LAB_MANEUVER_SEGMENTS={compact}",
+                ])
     kill_signal = "SIGTERM" if engine == "magnetar" else "SIGINT"
     command = [
         "systemd-run", "--user", "--unit", unit.removesuffix(".service"), "--collect",
         "--property=Description=VRageCage isolated Space Engineers worker",
-        f"--property=KillSignal={kill_signal}", "--property=TimeoutStopSec=60",
+        f"--property=KillSignal={kill_signal}",
     ]
+    if local_test_runtime_deadline_seconds is None:
+        command.append("--property=TimeoutStopSec=60")
+    else:
+        # RuntimeMaxSec is enforced by the host service manager, independent
+        # of game/mod updates. Control the entire disposable service cgroup;
+        # allow a short save/exit grace, then systemd terminates remaining
+        # processes. Production/manual services do not take this branch.
+        command.extend([
+            f"--property=RuntimeMaxSec={local_test_runtime_deadline_seconds}",
+            "--property=TimeoutStopSec=10",
+            "--property=KillMode=control-group",
+        ])
     for value in env_args:
         command.append(f"--setenv={value}")
     runner = "run-magnetar.sh" if engine == "magnetar" else "run-server.sh"
@@ -275,6 +1531,14 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def command_stop(args: argparse.Namespace) -> int:
+    if getattr(args, "expected_run_id", None) is not None:
+        expected = args.expected_run_id
+        if len(expected) != 32 or any(value not in "0123456789abcdef" for value in expected):
+            raise SystemExit("expected run identity must be lowercase 32-hex")
+        verified = subprocess.run([script("lab-contract.py"), "verify-runtime", str(instance_path(args.instance)), expected],
+                                  text=True, capture_output=True)
+        if verified.returncode != 0:
+            raise SystemExit("active run differs from the owned trial; refusing to stop")
     env = os.environ.copy()
     env["VRAGECAGE_WORKER_ROOT"] = str(worker_root())
     engine = instance_engine(args.instance)
@@ -325,13 +1589,25 @@ def command_wait(args: argparse.Namespace) -> int:
         receipt, _ = read_receipt(args.instance)
         observation_count = len(receipt.get("observations", [])) if receipt is not None and isinstance(receipt.get("observations"), list) else 0
         observations = receipt.get("observations", []) if receipt is not None and isinstance(receipt.get("observations"), list) else []
+        operation_events = receipt.get("lab_operation_events", []) if receipt is not None and isinstance(receipt.get("lab_operation_events"), list) else []
+        evidence = [*observations, *operation_events]
         requirements_met = all(
-            any(requirement in observation for observation in observations if isinstance(observation, str))
+            any(requirement in observation for observation in evidence if isinstance(observation, str))
             for requirement in args.require_observation
         )
         if receipt is not None and receipt.get("passed") is True and observation_count >= args.observations and requirements_met:
             emit(receipt)
             return 0
+        if (receipt is not None and receipt.get("lab_operation_terminal") is True
+                and receipt.get("passed") is not True):
+            emit({
+                "schema": "vragecage.operation.v1",
+                "operation": "wait",
+                "instance": args.instance,
+                "status": "lab_operation_failed",
+                "receipt": receipt,
+            })
+            return 1
         state = subprocess.run(
             ["systemctl", "--user", "is-active", "--quiet", unit]
         ).returncode
@@ -405,6 +1681,21 @@ def command_register_plugin(args: argparse.Namespace) -> int:
     return status
 
 
+def command_register_passive_telemetry_plugin(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to stage a plugin while instance is running: {args.instance}")
+    argv = [script("register-magnetar-plugin.py"), str(instance_path(args.instance)),
+            "voidwright-passive-telemetry", args.source, "--passive-telemetry"]
+    if args.replace:
+        argv.append("--replace")
+    status = run_checked(argv)
+    if status == 0:
+        emit({"schema": "vragecage.operation.v1", "operation": "stage_passive_telemetry",
+              "instance": args.instance, "plugin_id": "voidwright-passive-telemetry",
+              "permission_scope": "read_only_observation", "status": "registered"})
+    return status
+
+
 def command_import_world(args: argparse.Namespace) -> int:
     env = os.environ.copy()
     env["VRAGECAGE_WORKER_ROOT"] = str(worker_root())
@@ -423,17 +1714,153 @@ def command_lab_drive(args: argparse.Namespace) -> int:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     ).returncode == 0:
         raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
-    return run_checked([
+    command = [
         script("lab-contract.py"), "plan-drive", str(instance_path(args.instance)),
         str(args.controller_id), "--distance", str(args.distance),
         "--max-speed", str(args.max_speed), "--timeout-ticks", str(args.timeout_ticks),
+    ]
+    if args.reverse:
+        command.append("--reverse")
+    return run_checked(command)
+
+
+def command_lab_direct_maneuver(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    command = [script("lab-contract.py"), "plan-direct-maneuver", str(instance_path(args.instance))]
+    if any(value is not None for value in (args.controller_id, args.grid_id, args.camera_id)):
+        if any(value is None for value in (args.controller_id, args.grid_id, args.camera_id)):
+            raise SystemExit("manual target IDs must be supplied together, or omitted for discovery")
+        command.extend([str(args.controller_id), str(args.grid_id), str(args.camera_id)])
+    for segment in args.segment:
+        command.extend(["--segment", segment])
+    return run_checked(command)
+
+
+def command_lab_preflight_only(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    command = [
+        script("lab-contract.py"), "plan-preflight-only", str(instance_path(args.instance)),
+    ]
+    if any(value is not None for value in (args.controller_id, args.grid_id, args.camera_id)):
+        if any(value is None for value in (args.controller_id, args.grid_id, args.camera_id)):
+            raise SystemExit("manual target IDs must be supplied together, or omitted for discovery")
+        command.extend([str(args.controller_id), str(args.grid_id), str(args.camera_id)])
+    command.extend(["--max-speed", str(args.max_speed), "--timeout-ticks", str(args.timeout_ticks)])
+    return run_checked(command)
+
+
+def command_lab_command_activate(args: argparse.Namespace) -> int:
+    instance = instance_path(args.instance)
+    if not instance_is_active(args.instance):
+        raise SystemExit("stage-two activation requires the discovery-only service to be running")
+    return run_checked([script("lab-contract.py"), "activate-preflight-from-discovery",
+                        str(instance), "--wait-seconds", str(args.wait_seconds)])
+
+
+def command_lab_zero_hold_activate(args: argparse.Namespace) -> int:
+    instance = instance_path(args.instance)
+    if not instance_is_active(args.instance):
+        raise SystemExit("zero-hold activation requires the discovery-only service to be running")
+    return run_checked([script("lab-contract.py"), "activate-zero-hold-from-discovery",
+                        str(instance), "--wait-seconds", str(args.wait_seconds)])
+
+
+def command_lab_sensor_frame(args: argparse.Namespace) -> int:
+    if subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", unit_name(args.instance)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0:
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    return run_checked([
+        script("lab-contract.py"), "plan-sensor-frame", str(instance_path(args.instance)),
+        str(args.camera_id), "--width", str(args.width), "--height", str(args.height),
+        "--range", str(args.range_meters), "--fov", str(args.fov_degrees),
     ])
+
+
+def command_lab_rotate_stator(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    return run_checked([
+        script("lab-contract.py"), "plan-rotate-stator", str(instance_path(args.instance)),
+        str(args.stator_id), str(args.camera_id), args.expected_name,
+        str(args.desired_angle_degrees), "--max-rpm", str(args.max_rpm),
+        "--timeout-ticks", str(args.timeout_ticks),
+    ])
+
+
+def command_lab_play_recorder(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    return run_checked([
+        script("lab-contract.py"), "plan-recorded-route", str(instance_path(args.instance)),
+        str(args.controller_id), str(args.recorder_id), "--duration-ticks", str(args.duration_ticks),
+    ])
+
+
+def command_lab_follow_recorder(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    return run_checked([
+        script("lab-contract.py"), "plan-follow-recorder", str(instance_path(args.instance)),
+        str(args.controller_id), str(args.recorder_id), "--max-speed", str(args.max_speed),
+        "--arrival-radius", str(args.arrival_radius), "--timeout-ticks", str(args.timeout_ticks),
+    ])
+
+
+def command_lab_drive_zone(args: argparse.Namespace) -> int:
+    if instance_is_active(args.instance):
+        raise SystemExit(f"refusing to plan a lab command while instance is running: {args.instance}")
+    inspection = subprocess.run(
+        [script("fixture-contract.py"), "inspect", str(instance_path(args.instance))],
+        text=True, capture_output=True,
+    )
+    if inspection.returncode != 0:
+        raise SystemExit(inspection.stderr.strip() or "fixture inspection failed")
+    fixture = json.loads(inspection.stdout)
+    matches = [target for target in fixture.get("gps_targets", [])
+               if isinstance(target, dict) and target.get("name") == args.zone]
+    if len(matches) != 1:
+        raise SystemExit(f"zone name must resolve exactly once in fixture GPS targets: {args.zone!r}")
+    target = matches[0]
+    depth_mode = args.depth_camera_id is not None
+    max_speed = args.max_speed if args.max_speed is not None else (0.5 if depth_mode else 1.0)
+    timeout_ticks = args.timeout_ticks if args.timeout_ticks is not None else (900 if depth_mode else 1800)
+    command = [
+        script("lab-contract.py"), "plan-drive-to", str(instance_path(args.instance)),
+        str(args.controller_id), args.zone, str(target["x"]), str(target["y"]), str(target["z"]),
+        "--max-speed", str(max_speed), "--arrival-radius", str(args.arrival_radius),
+        "--timeout-ticks", str(timeout_ticks), "--offset-left", str(args.offset_left),
+    ]
+    if depth_mode:
+        command.extend(["--depth-camera-id", str(args.depth_camera_id)])
+    if args.start_delay_ticks:
+        command.extend(["--start-delay-ticks", str(args.start_delay_ticks)])
+    return run_checked(command)
 
 
 def command_fixture_inspect(args: argparse.Namespace) -> int:
     return run_checked([
         script("fixture-contract.py"), "inspect", str(instance_path(args.instance)),
     ])
+
+
+def command_lab_trial(args: argparse.Namespace) -> int:
+    command = [sys.executable, script("lab-trial.py"), str(instance_path(args.instance)),
+               "--cli", str(Path(__file__).resolve())]
+    for name in ("fixture_id", "request_id", "controller_id", "depth_camera_id", "target", "snapshot_relative_path", "grid_name"):
+        command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
+    if args.execute:
+        command.extend(["--execute", "--expect-plan-sha256", args.expect_plan_sha256])
+    return run_checked(command)
+
+
+def command_lab_trial_status(args: argparse.Namespace) -> int:
+    return run_checked([sys.executable, script("lab-trial.py"), str(instance_path(args.instance)),
+                        "--cli", str(Path(__file__).resolve()), "--status",
+                        "--fixture-id", args.fixture_id, "--request-id", args.request_id])
 
 
 def command_fixture_opt_in(args: argparse.Namespace) -> int:
@@ -448,6 +1875,54 @@ def command_fixture_opt_in(args: argparse.Namespace) -> int:
     return run_checked(argv)
 
 
+def command_passive_telemetry_export(args: argparse.Namespace) -> int:
+    jsonl, summary, _ = collect_passive_telemetry(args.instance, args.run_id)
+    if args.stream:
+        write_passive_telemetry_envelope(sys.stdout.buffer, args.run_id, jsonl, summary)
+        sys.stdout.buffer.flush()
+    else:
+        emit({"schema": "vragecage.passive-telemetry-export.v1", "instance": args.instance,
+              "run_id": args.run_id, "status": "verified", "jsonl_size_bytes": len(jsonl),
+              "summary_size_bytes": len(summary)})
+    return 0
+
+
+def command_passive_telemetry_status(args: argparse.Namespace) -> int:
+    return run_checked([script("passive-telemetry-contract.py"), "status",
+                        str(instance_path(args.instance))])
+
+
+def client_passive_telemetry_export(args: argparse.Namespace, host: str | None) -> int:
+    if args.local:
+        jsonl, summary, metadata = collect_passive_telemetry(args.instance, args.run_id)
+    else:
+        assert host is not None
+        forwarded = ["_worker", "passive-telemetry-export", args.instance, args.run_id, "--stream"]
+        remote = f"python3 ~/{REMOTE_CLI} {shlex.join(forwarded)}"
+        process = subprocess.Popen(["ssh", "-F", "/dev/null", host, remote], stdout=subprocess.PIPE)
+        assert process.stdout is not None
+        try:
+            jsonl, summary = read_passive_telemetry_envelope(process.stdout, args.run_id)
+        except BaseException:
+            process.terminate()
+            process.wait()
+            raise
+        return_code = process.wait()
+        if return_code != 0:
+            raise SystemExit(f"worker passive telemetry export failed with status {return_code}")
+        summary_value = _load_passive_json(summary, "summary")
+        metadata = _validate_passive_capture(jsonl, summary_value, args.run_id)
+        metadata["jsonl_sha256"] = hashlib.sha256(jsonl).hexdigest()
+        metadata["summary_sha256"] = hashlib.sha256(summary).hexdigest()
+        metadata["jsonl_size_bytes"] = len(jsonl)
+        metadata["summary_size_bytes"] = len(summary)
+
+    output_paths = store_passive_telemetry(Path(args.output_dir), args.run_id, jsonl, summary)
+    emit({"schema": "vragecage.passive-telemetry-export.v1", "instance": args.instance,
+          "status": "verified", **metadata, "output_paths": output_paths, "server_source_modified": False})
+    return 0
+
+
 def worker_main(args: argparse.Namespace) -> int:
     commands = {
         "doctor": command_doctor,
@@ -460,15 +1935,50 @@ def worker_main(args: argparse.Namespace) -> int:
         "smoke": command_smoke,
         "register-mod": command_register_mod,
         "register-plugin": command_register_plugin,
+        "register-passive-telemetry-plugin": command_register_passive_telemetry_plugin,
         "import-world": command_import_world,
         "lab-drive": command_lab_drive,
+        "lab-direct-maneuver": command_lab_direct_maneuver,
+        "lab-preflight-only": command_lab_preflight_only,
+        "lab-command-activate": command_lab_command_activate,
+        "lab-zero-hold-activate": command_lab_zero_hold_activate,
+        "lab-sensor-frame": command_lab_sensor_frame,
+        "lab-rotate-stator": command_lab_rotate_stator,
+        "lab-play-recorder": command_lab_play_recorder,
+        "lab-follow-recorder": command_lab_follow_recorder,
+        "lab-drive-zone": command_lab_drive_zone,
         "fixture-inspect": command_fixture_inspect,
+        "lab-trial": command_lab_trial,
+        "lab-trial-status": command_lab_trial_status,
         "fixture-opt-in": command_fixture_opt_in,
+        "passive-telemetry-export": command_passive_telemetry_export,
+        "passive-telemetry-status": command_passive_telemetry_status,
     }
+    if args.command in ("run", "stop", "lab-command-activate", "lab-zero-hold-activate"):
+        instance = instance_path(args.instance)
+        if instance.is_symlink() or not instance.is_dir():
+            raise SystemExit("lifecycle operations require an existing non-symlink instance")
+        descriptor = os.open(instance / ".vragecage-lifecycle.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "a+b") as lock:
+            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+                raise SystemExit("lifecycle lock must be a regular file")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                emit({"schema": "vragecage.operation.v1", "operation": args.command, "instance": args.instance, "status": "lifecycle_busy"})
+                return 75
+            return commands[args.command](args)
     return commands[args.command](args)
 
 
 def client_main(args: argparse.Namespace) -> int:
+    if args.command == "passive-telemetry-export":
+        host = None if args.local else args.host or configured_host()
+        if not args.local and host is None:
+            raise SystemExit("worker target required: pass --host, set VRAGECAGE_HOST, or configure ~/.config/vragecage/config.json")
+        return client_passive_telemetry_export(args, host)
+    if args.command == "stage-passive-telemetry" and args.local:
+        return command_register_passive_telemetry_plugin(args)
     if args.local:
         return worker_main(args)
     host = args.host or configured_host()
@@ -476,8 +1986,9 @@ def client_main(args: argparse.Namespace) -> int:
         raise SystemExit(
             "worker target required: pass --host, set VRAGECAGE_HOST, or configure ~/.config/vragecage/config.json"
         )
-    if args.command in ("stage-mod", "stage-world", "stage-plugin"):
-        source = Path(args.path).resolve()
+    if args.command in ("stage-mod", "stage-world", "stage-plugin", "stage-passive-telemetry", "import-world"):
+        source_arg = args.source if args.command == "import-world" else args.path
+        source = Path(source_arg).resolve()
         if not source.is_dir():
             raise SystemExit(f"source directory does not exist: {source}")
         if args.command == "stage-mod" and not (source / "Data").is_dir():
@@ -486,12 +1997,17 @@ def client_main(args: argparse.Namespace) -> int:
             len(list(source.glob("*.xml"))) != 1 or not (source / "vragecage.plugin.json").is_file()
         ):
             raise SystemExit("plugin source requires one root XML manifest and vragecage.plugin.json")
-        if args.command == "stage-world":
+        if args.command == "stage-passive-telemetry" and (
+            len(list(source.glob("*.xml"))) != 1 or
+            not (source / "vragecage.passive-telemetry-plugin.json").is_file()
+        ):
+            raise SystemExit("passive telemetry source requires its root manifest and read-only package contract")
+        if args.command in ("stage-world", "import-world"):
             for required in ("Sandbox.sbc", "Sandbox_config.sbc", "SANDBOX_0_0_0_.sbs"):
                 if not (source / required).is_file():
                     raise SystemExit(f"world is missing required file: {required}")
         validate_upload_tree(source)
-        label = args.mod_name if args.command == "stage-mod" else args.plugin_id if args.command == "stage-plugin" else "world"
+        label = args.mod_name if args.command == "stage-mod" else args.plugin_id if args.command == "stage-plugin" else "voidwright-passive-telemetry" if args.command == "stage-passive-telemetry" else "world"
         incoming = f".local/share/vragecage-worker/incoming/{args.instance}-{label}-{uuid.uuid4().hex}"
         create = f"mkdir -p {shlex.quote(incoming)}"
         if subprocess.run(["ssh", "-F", "/dev/null", host, create]).returncode != 0:
@@ -513,8 +2029,20 @@ def client_main(args: argparse.Namespace) -> int:
                 forwarded = ["_worker", "register-plugin", args.instance, args.plugin_id, f"~/{incoming}"]
                 if args.replace:
                     forwarded.append("--replace")
-            else:
+            elif args.command == "stage-passive-telemetry":
+                forwarded = ["_worker", "register-passive-telemetry-plugin", args.instance,
+                             f"~/{incoming}"]
+                if args.replace:
+                    forwarded.append("--replace")
+            elif args.command == "stage-world":
                 forwarded = ["_worker", "import-world", args.instance, f"~/{incoming}", "--engine", args.engine]
+                if args.engine_ready:
+                    forwarded.append("--engine-ready")
+                if args.destructive_lab:
+                    forwarded.append("--destructive-lab")
+            else:
+                forwarded = ["_worker", "import-world", args.instance, f"~/{incoming}",
+                             "--engine", args.engine]
                 if args.engine_ready:
                     forwarded.append("--engine-ready")
                 if args.destructive_lab:
@@ -538,6 +2066,8 @@ def client_main(args: argparse.Namespace) -> int:
         forwarded.append("--reprepare")
     if hasattr(args, "timeout"):
         forwarded.extend(["--timeout", str(args.timeout)])
+    if args.command == "lab-command-activate":
+        forwarded.extend(["--wait-seconds", str(args.wait_seconds)])
     if hasattr(args, "observations"):
         forwarded.extend(["--observations", str(args.observations)])
     for requirement in getattr(args, "require_observation", []):
@@ -547,10 +2077,68 @@ def client_main(args: argparse.Namespace) -> int:
             str(args.controller_id), "--distance", str(args.distance),
             "--max-speed", str(args.max_speed), "--timeout-ticks", str(args.timeout_ticks),
         ])
+        if args.reverse:
+            forwarded.append("--reverse")
+    if args.command == "lab-direct-maneuver":
+        forwarded.extend([str(args.controller_id), str(args.grid_id), str(args.camera_id)])
+        for segment in args.segment:
+            forwarded.extend(["--segment", segment])
+    if args.command == "lab-preflight-only":
+        forwarded.extend([str(args.controller_id), str(args.grid_id), str(args.camera_id),
+                          "--max-speed", str(args.max_speed), "--timeout-ticks", str(args.timeout_ticks)])
+    if args.command == "lab-sensor-frame":
+        forwarded.extend([
+            str(args.camera_id), "--width", str(args.width), "--height", str(args.height),
+            "--range", str(args.range_meters), "--fov", str(args.fov_degrees),
+        ])
+    if args.command == "lab-rotate-stator":
+        forwarded.extend([
+            str(args.stator_id), str(args.camera_id), args.expected_name,
+            str(args.desired_angle_degrees), "--max-rpm", str(args.max_rpm),
+            "--timeout-ticks", str(args.timeout_ticks),
+        ])
+    if args.command == "lab-play-recorder":
+        forwarded.extend([
+            str(args.controller_id), str(args.recorder_id),
+            "--duration-ticks", str(args.duration_ticks),
+        ])
+    if args.command == "lab-follow-recorder":
+        forwarded.extend([
+            str(args.controller_id), str(args.recorder_id), "--max-speed", str(args.max_speed),
+            "--arrival-radius", str(args.arrival_radius), "--timeout-ticks", str(args.timeout_ticks),
+        ])
+    if args.command == "lab-drive-zone":
+        depth_mode = args.depth_camera_id is not None
+        max_speed = args.max_speed if args.max_speed is not None else (0.5 if depth_mode else 1.0)
+        timeout_ticks = args.timeout_ticks if args.timeout_ticks is not None else (900 if depth_mode else 1800)
+        forwarded.extend([
+            str(args.controller_id), args.zone, "--max-speed", str(max_speed),
+            "--arrival-radius", str(args.arrival_radius),
+            "--timeout-ticks", str(timeout_ticks), "--offset-left", str(args.offset_left),
+        ])
+        if depth_mode:
+            forwarded.extend(["--depth-camera-id", str(args.depth_camera_id)])
+        if args.start_delay_ticks:
+            forwarded.extend(["--start-delay-ticks", str(args.start_delay_ticks)])
     if args.command == "fixture-opt-in":
         forwarded.append(str(args.controller_id))
         if args.label:
             forwarded.extend(["--label", args.label])
+    if args.command == "lab-trial":
+        for name in ("fixture_id", "request_id", "controller_id", "depth_camera_id", "target", "snapshot_relative_path", "grid_name"):
+            forwarded.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
+        if args.execute:
+            forwarded.extend(["--execute", "--expect-plan-sha256", args.expect_plan_sha256])
+    if args.command == "lab-trial-status":
+        forwarded.extend(["--fixture-id", args.fixture_id, "--request-id", args.request_id])
+    if args.command == "run" and args.expected_operation_id is not None:
+        forwarded.extend(["--expected-operation-id", args.expected_operation_id, "--expected-command-sha256", args.expected_command_sha256])
+    if args.command == "run" and args.discovery_only:
+        forwarded.append("--discovery-only")
+    if args.command == "run" and args.motion_telemetry_interval_ticks is not None:
+        forwarded.extend(["--motion-telemetry-interval-ticks", str(args.motion_telemetry_interval_ticks)])
+    if args.command == "stop" and args.expected_run_id is not None:
+        forwarded.extend(["--expected-run-id", args.expected_run_id])
     remote = f"python3 ~/{REMOTE_CLI} {shlex.join(forwarded)}"
     return subprocess.run(["ssh", "-F", "/dev/null", host, remote]).returncode
 
@@ -575,6 +2163,15 @@ def parser() -> argparse.ArgumentParser:
     ):
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("instance", type=validate_instance)
+        if name == "run":
+            command.add_argument("--discovery-only", action="store_true",
+                                 help="start an isolated read-only discovery bootstrap for a later preflight activation")
+            command.add_argument("--expected-operation-id")
+            command.add_argument("--expected-command-sha256")
+            command.add_argument("--motion-telemetry-interval-ticks", type=validate_motion_telemetry_interval,
+                                 help="capture read-only motion telemetry every 1-600 simulation ticks; default 10")
+        if name == "stop":
+            command.add_argument("--expected-run-id")
     wait = subparsers.add_parser("wait", help="wait for a persistent instance to become ready")
     wait.add_argument("instance", type=validate_instance)
     wait.add_argument("--timeout", type=int, default=180)
@@ -597,6 +2194,13 @@ def parser() -> argparse.ArgumentParser:
     plugin.add_argument("path")
     plugin.add_argument("--id", dest="plugin_id", required=True, type=validate_instance)
     plugin.add_argument("--replace", action="store_true")
+    passive_stage = subparsers.add_parser(
+        "stage-passive-telemetry",
+        help="stage the separate read-only player-consented Driving Lab telemetry plugin",
+    )
+    passive_stage.add_argument("instance", type=validate_instance)
+    passive_stage.add_argument("path")
+    passive_stage.add_argument("--replace", action="store_true")
     world = subparsers.add_parser("stage-world", help="copy a local save into a new guarded instance")
     world.add_argument("instance", type=validate_instance)
     world.add_argument("path")
@@ -613,6 +2217,10 @@ def parser() -> argparse.ArgumentParser:
     register_plugin.add_argument("plugin_id", type=validate_instance)
     register_plugin.add_argument("source")
     register_plugin.add_argument("--replace", action="store_true")
+    register_passive = subparsers.add_parser("register-passive-telemetry-plugin", help=argparse.SUPPRESS)
+    register_passive.add_argument("instance", type=validate_instance)
+    register_passive.add_argument("source")
+    register_passive.add_argument("--replace", action="store_true")
     import_world = subparsers.add_parser("import-world", help=argparse.SUPPRESS)
     import_world.add_argument("instance", type=validate_instance)
     import_world.add_argument("source")
@@ -626,6 +2234,81 @@ def parser() -> argparse.ArgumentParser:
     drive.add_argument("--distance", type=float, default=3.0)
     drive.add_argument("--max-speed", type=float, default=2.0)
     drive.add_argument("--timeout-ticks", type=int, default=600)
+    drive.add_argument("--reverse", action="store_true",
+                       help="back up at no more than 0.5 m/s for at most 3 meters")
+    maneuver = subparsers.add_parser(
+        "lab-direct-maneuver", help="queue a composed, bounded planner-independent Voidwright maneuver"
+    )
+    maneuver.add_argument("instance", type=validate_instance)
+    maneuver.add_argument("controller_id", type=int, nargs="?")
+    maneuver.add_argument("grid_id", type=int, nargs="?")
+    maneuver.add_argument("camera_id", type=int, nargs="?")
+    maneuver.add_argument("--segment", action="append", required=True,
+                          help="kind:value:max-speed:timeout-ticks; repeat up to 12 times in sequence order")
+    preflight = subparsers.add_parser("lab-preflight-only", help="collect exact host and mod preflight without actuator dispatch")
+    preflight.add_argument("instance", type=validate_instance)
+    preflight.add_argument("controller_id", type=int, nargs="?")
+    preflight.add_argument("grid_id", type=int, nargs="?")
+    preflight.add_argument("camera_id", type=int, nargs="?")
+    preflight.add_argument("--max-speed", type=float, default=0.8)
+    preflight.add_argument("--timeout-ticks", type=int, default=300)
+    stage_two = subparsers.add_parser("lab-command-activate", help="activate one preflight-only command from current same-session discovery")
+    stage_two.add_argument("instance", type=validate_instance)
+    stage_two.add_argument("--wait-seconds", type=int, default=45)
+    zero_hold = subparsers.add_parser("lab-zero-hold-activate", help="activate one fixed zero-only stationary hold from current same-session discovery")
+    zero_hold.add_argument("instance", type=validate_instance)
+    zero_hold.add_argument("--wait-seconds", type=int, default=45)
+    sensor = subparsers.add_parser(
+        "lab-sensor-frame", help="queue one bounded server-side depth sensor frame"
+    )
+    sensor.add_argument("instance", type=validate_instance)
+    sensor.add_argument("camera_id", type=int)
+    sensor.add_argument("--width", type=int, default=32)
+    sensor.add_argument("--height", type=int, default=18)
+    sensor.add_argument("--range", dest="range_meters", type=float, default=150.0)
+    sensor.add_argument("--fov", dest="fov_degrees", type=float, default=70.0)
+    rotate = subparsers.add_parser(
+        "lab-rotate-stator", help="rotate one named, camera-bound stator in a disposable fixture"
+    )
+    rotate.add_argument("instance", type=validate_instance)
+    rotate.add_argument("stator_id", type=int)
+    rotate.add_argument("camera_id", type=int)
+    rotate.add_argument("expected_name")
+    rotate.add_argument("desired_angle_degrees", type=float)
+    rotate.add_argument("--max-rpm", type=float, default=0.5)
+    rotate.add_argument("--timeout-ticks", type=int, default=1800)
+    recorded = subparsers.add_parser(
+        "lab-play-recorder", help="play a saved Path Recorder route for a bounded simulation window"
+    )
+    recorded.add_argument("instance", type=validate_instance)
+    recorded.add_argument("controller_id", type=int)
+    recorded.add_argument("recorder_id", type=int)
+    recorded.add_argument("--duration-ticks", type=int, default=600,
+                          help="bounded playback window, 60-7200 simulation ticks")
+    follow = subparsers.add_parser(
+        "lab-follow-recorder", help="follow saved Path Recorder waypoints with bounded wheel guidance"
+    )
+    follow.add_argument("instance", type=validate_instance)
+    follow.add_argument("controller_id", type=int)
+    follow.add_argument("recorder_id", type=int)
+    follow.add_argument("--max-speed", type=float, default=1.0)
+    follow.add_argument("--arrival-radius", type=float, default=2.0)
+    follow.add_argument("--timeout-ticks", type=int, default=7200)
+    navigate = subparsers.add_parser(
+        "lab-drive-zone", help="queue bounded wheel guidance to an exact fixture GPS zone"
+    )
+    navigate.add_argument("instance", type=validate_instance)
+    navigate.add_argument("controller_id", type=int)
+    navigate.add_argument("zone", type=validate_observation_requirement)
+    navigate.add_argument("--max-speed", type=float)
+    navigate.add_argument("--arrival-radius", type=float, default=2.0)
+    navigate.add_argument("--timeout-ticks", type=int)
+    navigate.add_argument("--offset-left", type=float, default=0,
+                          help="offset target left of the controller's initial heading, -10 to 10 meters")
+    navigate.add_argument("--depth-camera-id", type=int,
+                          help="opt into the low-speed front-camera depth-guided controller")
+    navigate.add_argument("--start-delay-ticks", type=int, default=0,
+                          help="hold the rover stopped before depth-guided movement, up to 3600 simulation ticks")
     fixture_inspect = subparsers.add_parser(
         "fixture-inspect", help="inspect grids, Remote Controls, and GPS targets in a lab fixture"
     )
@@ -636,6 +2319,30 @@ def parser() -> argparse.ArgumentParser:
     fixture_opt_in.add_argument("instance", type=validate_instance)
     fixture_opt_in.add_argument("controller_id", type=int)
     fixture_opt_in.add_argument("--label", type=validate_observation_requirement)
+    trial = subparsers.add_parser("lab-trial", help="preview or execute one reviewed, idempotent bounded GPS trial")
+    trial.add_argument("instance", type=validate_instance)
+    for name in ("fixture-id", "request-id", "controller-id", "depth-camera-id", "target", "snapshot-relative-path", "grid-name"):
+        trial.add_argument("--" + name, required=True)
+    trial.add_argument("--execute", action="store_true")
+    trial.add_argument("--expect-plan-sha256")
+    trial_status = subparsers.add_parser("lab-trial-status", help="read a fixture-bound trial journal without replaying anything")
+    trial_status.add_argument("instance", type=validate_instance)
+    trial_status.add_argument("--fixture-id", required=True)
+    trial_status.add_argument("--request-id", required=True)
+    passive_export = subparsers.add_parser(
+        "passive-telemetry-export",
+        help="copy completed read-only Driving Lab telemetry from one exact disposable instance",
+    )
+    passive_export.add_argument("instance", type=validate_instance)
+    passive_export.add_argument("run_id", type=validate_run_id)
+    passive_export.add_argument("--output-dir",
+                                help="local directory for the verified JSONL and summary copies")
+    passive_export.add_argument("--stream", action="store_true", help=argparse.SUPPRESS)
+    passive_status = subparsers.add_parser(
+        "passive-telemetry-status",
+        help="show the verified read-only telemetry contract and current Magnetar run ID",
+    )
+    passive_status.add_argument("instance", type=validate_instance)
     return result
 
 
@@ -643,8 +2350,17 @@ def main() -> int:
     worker_mode = len(sys.argv) > 1 and sys.argv[1] == "_worker"
     argv = sys.argv[2:] if worker_mode else sys.argv[1:]
     args = parser().parse_args(argv)
+    if args.command == "lab-trial" and bool(args.expect_plan_sha256) != args.execute:
+        raise SystemExit("lab-trial requires --execute and --expect-plan-sha256 together")
+    if args.command == "run" and (args.expected_operation_id is None) != (args.expected_command_sha256 is None):
+        raise SystemExit("reviewed run requires both expected operation ID and command SHA256")
     if worker_mode:
         return worker_main(args)
+    if args.command == "passive-telemetry-export":
+        if args.stream:
+            raise SystemExit("--stream is reserved for the internal worker transport")
+        if not args.output_dir:
+            raise SystemExit("passive-telemetry-export requires --output-dir")
     return client_main(args)
 
 

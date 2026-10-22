@@ -21,12 +21,39 @@ esac
 [[ -f "$instance/SpaceEngineers-Dedicated.cfg" ]] || { echo "instance is not prepared: $instance" >&2; exit 70; }
 [[ "$(cat "$instance/.vragecage-engine" 2>/dev/null)" == "magnetar" ]] || { echo "instance is not a Magnetar instance" >&2; exit 64; }
 
+if [[ "$instance_name" == "land-local-test-hydro-scout-20261022-b" ]]; then
+  echo "Hydro Scout candidate b is retired after its invalid WorldId load failure" >&2
+  exit 64
+fi
+
+if [[ "$instance_name" == "land-local-test-hydro-scout-20261022-c" ]]; then
+  [[ -f "$instance/.vragecage-local-vehicle-test.json" && ! -L "$instance/.vragecage-local-vehicle-test.json" ]] || {
+    echo "Hydro Scout LocalVehicleTest cannot start without its exact config" >&2
+    exit 64
+  }
+  verifier="$instance/.hydro_scout_local_vehicle_test_packages.py"
+  [[ -f "$verifier" && ! -L "$verifier" ]] || { echo "Hydro Scout package verifier is missing or unsafe" >&2; exit 64; }
+  python3 "$verifier" "$instance" "$worker_root"
+fi
+
 if [[ "${VRAGECAGE_LAB_AUTHORITY:-}" == "destructive-lab" ]]; then
   [[ -n "${VRAGECAGE_LAB_RUN_ID:-}" ]] || { echo "missing destructive-lab run identity" >&2; exit 64; }
   "$script_dir/lab-contract.py" verify-runtime "$instance" "$VRAGECAGE_LAB_RUN_ID" >/dev/null
 elif [[ -e "$instance/.vragecage-lab.json" ]]; then
   echo "refusing to launch a destructive-lab instance without activated authority" >&2
   exit 64
+fi
+
+if [[ -e "$instance/.vragecage-passive-telemetry.json" ]]; then
+  [[ ! -e "$instance/.vragecage-lab.json" ]] || {
+    echo "refusing to combine passive read-only telemetry with destructive-lab authority" >&2
+    exit 64
+  }
+  passive_run_id="$(python3 "$script_dir/passive-telemetry-contract.py" activate "$instance")"
+  export VRAGECAGE_PASSIVE_TELEMETRY_AUTHORITY=read_only_observation
+  export VRAGECAGE_PASSIVE_TELEMETRY_RUN_ID="$passive_run_id"
+  export VRAGECAGE_PASSIVE_TELEMETRY_INSTANCE="$instance_name"
+  export VRAGECAGE_PASSIVE_TELEMETRY_CONTRACT_SHA256="$(sha256sum "$instance/.vragecage-passive-telemetry.json" | awk '{print $1}')"
 fi
 
 bind_ip="$(sed -n 's|.*<IP>\(.*\)</IP>.*|\1|p' "$instance/SpaceEngineers-Dedicated.cfg" | head -1)"

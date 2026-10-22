@@ -10,7 +10,8 @@ from pathlib import Path
 
 
 def build_world_tree(world_file: Path, mod_name: str) -> ET.ElementTree:
-    ET.register_namespace("xsd", "http://www.w3.org/2001/XMLSchema")
+    xsd_namespace = "http://www.w3.org/2001/XMLSchema"
+    ET.register_namespace("xsd", xsd_namespace)
     ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
     tree = ET.parse(world_file)
     root = tree.getroot()
@@ -25,6 +26,12 @@ def build_world_tree(world_file: Path, mod_name: str) -> ET.ElementTree:
     ET.SubElement(item, "PublishedFileId").text = "0"
     ET.SubElement(item, "PublishedServiceName").text = "Steam"
     ET.SubElement(item, "IsDependency").text = "false"
+    # VRage object-builder XML sometimes stores QName-valued strings (such as
+    # xsi:type="xsd:string") in attribute values. ElementTree does not retain
+    # an otherwise-unused xmlns:xsd declaration while parsing, so restore it
+    # explicitly when those values need the prefix during engine deserialization.
+    if any("xsd:" in value for node in root.iter() for value in node.attrib.values()):
+        root.set("xmlns:xsd", xsd_namespace)
     return tree
 
 

@@ -17,6 +17,13 @@ the copied world. The source remains read-only. Authority metadata lives at the 
 outside the engine-owned `World` directory, while every launch receives a fresh run ID and private quarantine folder.
 Anything exported from that folder remains untrusted; no artifact-promotion command exists yet.
 
+Human-driven telemetry uses the separate `stage-passive-telemetry` path. Its dedicated plugin
+assembly exposes only explicit player consent, exact occupied-grid observation, and bounded
+JSONL/summary export. Staging writes a hash-bound `read_only_observation` contract and refuses
+instances with destructive-lab authority. Launch verification supplies a fresh observer run ID;
+it does not set the destructive-lab environment or create a command quarantine. This path does
+not install programmable-block scripts or grant movement/control authority.
+
 ## Proven runtime
 
 The reference worker has completed a real-engine smoke on Space Engineers Dedicated Server

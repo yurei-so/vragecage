@@ -1,0 +1,244 @@
+using Sandbox.ModAPI;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using VRage.Game.ModAPI;
+using VRage.ModAPI;
+using VRage.Utils;
+using VRageMath;
+
+namespace HoloCamRestored2D
+{
+    // Disposable-lab, grid-only proof. No LCD target or physical camera is used.
+    public sealed partial class PortalLcdSession
+    {
+        const string VrageCageVirtualExpectedWorld = "@@WORLD@@";
+        const string VrageCageVirtualRequestId = "@@REQUEST@@";
+        const string VrageCageVirtualCaptureId = "@@CAPTURE@@";
+        const int VrageCageVirtualWidth = @@WIDTH@@;
+        const int VrageCageVirtualHeight = @@HEIGHT@@;
+        const double VrageCageVirtualRange = @@RANGE@@;
+        readonly Vector3D[] vrageCageVirtualOrigins = new Vector3D[] { @@ORIGINS@@ };
+        readonly Vector3D[] vrageCageVirtualForwards = new Vector3D[] { @@FORWARDS@@ };
+        readonly Vector3D[] vrageCageVirtualUps = new Vector3D[] { @@UPS@@ };
+        readonly double[] vrageCageVirtualFovs = new double[] { @@FOVS@@ };
+        readonly Dictionary<long, GridProxy> vrageCageVirtualProxies = new Dictionary<long, GridProxy>();
+        int vrageCageVirtualNextPose;
+        bool vrageCageVirtualInFlight;
+        bool vrageCageVirtualStopped;
+
+        void VrageCageTickVirtualCapture()
+        {
+            if (vrageCageVirtualStopped || vrageCageVirtualInFlight || ticks < 60 || ticks > 600 ||
+                vrageCageVirtualNextPose >= vrageCageVirtualOrigins.Length)
+                return;
+
+            string actualWorld = MyAPIGateway.Session != null ? MyAPIGateway.Session.Name : null;
+            if (!string.Equals(actualWorld, VrageCageVirtualExpectedWorld, StringComparison.Ordinal))
+            {
+                VrageCageVirtualReject("world-name-mismatch", actualWorld);
+                return;
+            }
+
+            // The first bounded primitive supports space-platform fixtures only. A planet would
+            // require a view-local terrain lattice; returning grids with missing terrain is unsafe.
+            var entities = new HashSet<IMyEntity>();
+            MyAPIGateway.Entities.GetEntities(entities, delegate(IMyEntity e)
+            {
+                return e is Sandbox.Game.Entities.MyPlanet || e is IMyCubeGrid;
+            });
+            foreach (IMyEntity entity in entities)
+                if (entity is Sandbox.Game.Entities.MyPlanet)
+                {
+                    VrageCageVirtualReject("planet-terrain-unsupported", actualWorld);
+                    return;
+                }
+
+            WorkerRasterSlot slot = FindFreeLcdWorkerSlot();
+            if (slot == null) return;
+            int index = vrageCageVirtualNextPose;
+            Vector3D origin = vrageCageVirtualOrigins[index];
+            Vector3D forward = vrageCageVirtualForwards[index];
+            Vector3D up = vrageCageVirtualUps[index];
+            MatrixD cam = MatrixD.CreateWorld(origin, forward, up);
+
+            // HoloView's existing grid cache is source-grid based. Keep virtual candidates in a
+            // separate dictionary so the physical-camera proxy lifecycle is unchanged.
+            vrageCageVirtualProxies.Clear();
+            var selected = new List<IMyCubeGrid>();
+            foreach (IMyEntity entity in entities)
+            {
+                IMyCubeGrid grid = entity as IMyCubeGrid;
+                if (grid == null || grid.Closed || grid.MarkedForClose || !entity.Save) continue;
+                BoundingBoxD bounds = grid.WorldAABB;
+                double radius = bounds.HalfExtents.Length();
+                if (Vector3D.Distance(origin, bounds.Center) - radius > VrageCageVirtualRange) continue;
+                selected.Add(grid);
+            }
+            selected.Sort(delegate(IMyCubeGrid a, IMyCubeGrid b)
+            {
+                return Vector3D.DistanceSquared(origin, a.WorldAABB.Center)
+                    .CompareTo(Vector3D.DistanceSquared(origin, b.WorldAABB.Center));
+            });
+            if (selected.Count > 64)
+            {
+                VrageCageVirtualReject("grid-budget-exceeded", actualWorld);
+                return;
+            }
+            for (int i = 0; i < selected.Count; i++)
+            {
+                IMyCubeGrid grid = selected[i];
+                GridProxy proxy = new GridProxy();
+                proxy.Source = grid;
+                proxy.SourceId = grid.EntityId;
+                vrageCageVirtualProxies.Add(grid.EntityId, proxy);
+            }
+
+            double previousFov = portalFovDegrees;
+            double previousAspect = surfaceAspect;
+            int previousWidth = lcdRasterWidth;
+            int previousHeight = lcdRasterHeight;
+            try
+            {
+                portalFovDegrees = vrageCageVirtualFovs[index];
+                surfaceAspect = (double)VrageCageVirtualWidth / VrageCageVirtualHeight;
+                lcdRasterWidth = VrageCageVirtualWidth;
+                lcdRasterHeight = VrageCageVirtualHeight;
+                PrepareStableRasterBlockScene(cam, vrageCageVirtualProxies);
+
+                WorkerRasterJob job = slot.Job;
+                job.VirtualIndex = index;
+                job.OutputId = 0;
+                job.CameraEntityId = 0;
+                job.SurfaceIndex = -1;
+                job.Cam = cam;
+                job.FovDegrees = vrageCageVirtualFovs[index];
+                job.Width = VrageCageVirtualWidth;
+                job.Height = VrageCageVirtualHeight;
+                job.OutputWidth = job.PresentationWidth = job.Width;
+                job.OutputHeight = job.PresentationHeight = job.Height;
+                job.GridRange = VrageCageVirtualRange;
+                job.TerrainRange = 0;
+                job.TerrainReady = false;
+                job.HasPlanet = false;
+                job.WaterEnabled = false;
+                job.SunDirection = Vector3D.Up;
+                job.WeatherIntensity = 0;
+                job.SolarMultiplier = 1;
+                job.WeatherName = string.Empty;
+                job.LowPixels = new byte[job.Width * job.Height * 4];
+                job.ReusableDepth = new float[job.Width * job.Height];
+                for (int p = 0; p < job.Width * job.Height; p++)
+                {
+                    job.LowPixels[p * 4] = 3;
+                    job.LowPixels[p * 4 + 1] = 5;
+                    job.LowPixels[p * 4 + 2] = 9;
+                    job.LowPixels[p * 4 + 3] = 255;
+                }
+                job.Boxes.Clear();
+                job.Meshes.Clear();
+                job.Boulders.Clear();
+                job.DetectedTrees.Clear();
+                job.Projectiles.Clear();
+                job.GeneratedPixels = null;
+                job.GeneratedRects = null;
+                job.FinalPixels = null;
+                job.HistoryPixels = null;
+                job.HistoryWidth = job.HistoryHeight = 0;
+                job.CachedGridPixels = null;
+                job.CachedGridDepth = null;
+                job.CachedGridSignature = 0;
+                job.Error = null;
+                job.AntiAliasMode = 0;
+                job.FrameGeneration = false;
+                job.Sharpen = 0;
+                job.TemporalBlend = 0;
+                job.ExposureEv = 0;
+                job.Contrast = 1;
+                job.NightVision = false;
+                job.TextureMode = 0;
+                job.UpscaleMode = 0;
+                job.TerrainPoints = null;
+                job.TerrainColors = null;
+                job.TerrainValid = null;
+                job.TerrainSupportsTrees = null;
+                job.TerrainMaterialKeys = null;
+                job.SnapshotTick = ticks;
+                job.SnapshotUtcTicks = DateTime.UtcNow.Ticks;
+                SnapshotGridSceneForWorker(job);
+                slot.Busy = true;
+                slot.Completed = false;
+                vrageCageVirtualInFlight = true;
+                vrageCageVirtualNextPose++;
+                MyAPIGateway.Parallel.StartBackground(delegate { RunWorkerRaster(job, slot); });
+            }
+            catch (Exception ex)
+            {
+                slot.Busy = false;
+                slot.Completed = false;
+                vrageCageVirtualInFlight = false;
+                VrageCageVirtualReject("snapshot-failed:" + ex.GetType().Name, actualWorld);
+            }
+            finally
+            {
+                portalFovDegrees = previousFov;
+                surfaceAspect = previousAspect;
+                lcdRasterWidth = previousWidth;
+                lcdRasterHeight = previousHeight;
+            }
+        }
+
+        void VrageCageCompleteVirtualFrame(WorkerRasterJob job)
+        {
+            vrageCageVirtualInFlight = false;
+            if (job.Error != null || job.FinalPixels == null ||
+                job.FinalPixels.Length != job.Width * job.Height * 4)
+            {
+                VrageCageVirtualReject("worker-failed", MyAPIGateway.Session != null ? MyAPIGateway.Session.Name : null);
+                return;
+            }
+            int index = job.VirtualIndex;
+            string basename = "vragecage-virtual-" + VrageCageVirtualCaptureId + "-" + index.ToString(CultureInfo.InvariantCulture);
+            byte[] pixels = job.FinalPixels;
+            using (TextWriter writer = MyAPIGateway.Utilities.WriteFileInWorldStorage(basename + ".rgba64.txt", typeof(PortalLcdSession)))
+                writer.Write(Convert.ToBase64String(pixels));
+
+            StringBuilder receipt = new StringBuilder(512);
+            receipt.Append("{\"schema\":\"vragecage.virtual-holoview.v1\",\"source_kind\":\"virtual\",\"request_id\":\"");
+            receipt.Append(VrageCageVirtualRequestId);
+            receipt.Append("\",\"world_name_observed\":\"");
+            receipt.Append(MyAPIGateway.Session.Name);
+            receipt.Append("\",\"pose_index\":").Append(index.ToString(CultureInfo.InvariantCulture));
+            receipt.Append(",\"snapshot_tick\":").Append(job.SnapshotTick.ToString(CultureInfo.InvariantCulture));
+            receipt.Append(",\"width\":").Append(job.Width.ToString(CultureInfo.InvariantCulture));
+            receipt.Append(",\"height\":").Append(job.Height.ToString(CultureInfo.InvariantCulture));
+            receipt.Append(",\"fov_degrees\":").Append(job.FovDegrees.ToString("R", CultureInfo.InvariantCulture));
+            VrageCageAppendVirtualVector(receipt, "origin", job.Cam.Translation);
+            VrageCageAppendVirtualVector(receipt, "forward", job.Cam.Forward);
+            VrageCageAppendVirtualVector(receipt, "up", job.Cam.Up);
+            receipt.Append(",\"geometry_primitives\":");
+            receipt.Append(job.Boxes.Count + job.Meshes.Count);
+            receipt.Append('}');
+            using (TextWriter writer = MyAPIGateway.Utilities.WriteFileInWorldStorage(basename + ".json", typeof(PortalLcdSession)))
+                writer.Write(receipt.ToString());
+            MyLog.Default.WriteLineAndConsole("[VRageCage] virtual HoloView capture=" + VrageCageVirtualCaptureId +
+                " request=" + VrageCageVirtualRequestId + " frame=" + index + " tick=" + job.SnapshotTick);
+        }
+
+        static void VrageCageAppendVirtualVector(StringBuilder text, string name, Vector3D value)
+        {
+            text.Append(",\"").Append(name).Append("\":[");
+            text.Append(value.X.ToString("R", CultureInfo.InvariantCulture)).Append(',');
+            text.Append(value.Y.ToString("R", CultureInfo.InvariantCulture)).Append(',');
+            text.Append(value.Z.ToString("R", CultureInfo.InvariantCulture)).Append(']');
+        }
+
+        void VrageCageVirtualReject(string reason, string actualWorld)
+        {
+            vrageCageVirtualStopped = true;
+            MyLog.Default.WriteLineAndConsole("[VRageCage] virtual HoloView rejected: " + reason + " world=" + actualWorld);
+        }
+    }
+}
